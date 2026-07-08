@@ -158,6 +158,27 @@ pub const Connection = struct {
         WriteFailed,
     };
 
+    /// `ErrorCause` as an error value; stored in `Reader.err`/`Writer.err`
+    /// when the flattened interface returns ReadFailed/WriteFailed.
+    pub const Failure = error{
+        TlsFailure,
+        CertificateVerificationFailure,
+        TlsTruncated,
+        TransportReadFailed,
+        TransportWriteFailed,
+    };
+
+    /// The most recent failure as an error value.
+    pub fn failure(conn: *const Connection) Failure {
+        return switch (conn.err orelse .ssl) {
+            .ssl => error.TlsFailure,
+            .certificate_verify => error.CertificateVerificationFailure,
+            .truncated => error.TlsTruncated,
+            .transport_read => error.TransportReadFailed,
+            .transport_write => error.TransportWriteFailed,
+        };
+    }
+
     pub fn errorMessage(conn: *const Connection) []const u8 {
         return conn.err_buf[0..conn.err_len];
     }
@@ -284,6 +305,9 @@ pub const Connection = struct {
     pub const Reader = struct {
         conn: *Connection,
         interface: Io.Reader,
+        /// Set when the interface returns error.ReadFailed; details in
+        /// `conn.errorMessage()`.
+        err: ?Failure = null,
 
         pub fn init(conn: *Connection, buffer: []u8) Reader {
             return .{
@@ -300,7 +324,10 @@ pub const Connection = struct {
         fn stream(io_r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
             const r: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
             const dest = limit.slice(try w.writableSliceGreedy(1));
-            const n = try r.conn.read(dest);
+            const n = r.conn.read(dest) catch |err| {
+                r.err = r.conn.failure();
+                return err;
+            };
             if (n == 0) return error.EndOfStream;
             w.advance(n);
             return n;
@@ -310,6 +337,9 @@ pub const Connection = struct {
     pub const Writer = struct {
         conn: *Connection,
         interface: Io.Writer,
+        /// Set when the interface returns error.WriteFailed; details in
+        /// `conn.errorMessage()`.
+        err: ?Failure = null,
 
         pub fn init(conn: *Connection, buffer: []u8) Writer {
             return .{
@@ -323,21 +353,20 @@ pub const Connection = struct {
 
         fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
             const w: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
-            const conn = w.conn;
             var total: usize = 0;
             const buffered = io_w.buffered();
             if (buffered.len != 0) {
-                try conn.encryptAll(buffered);
+                try w.encryptAll(buffered);
                 total += buffered.len;
             }
             for (data[0 .. data.len - 1]) |slice| {
                 if (slice.len == 0) continue;
-                try conn.encryptAll(slice);
+                try w.encryptAll(slice);
                 total += slice.len;
             }
             const pattern = data[data.len - 1];
             if (pattern.len != 0) for (0..splat) |_| {
-                try conn.encryptAll(pattern);
+                try w.encryptAll(pattern);
                 total += pattern.len;
             };
             return io_w.consume(total);
@@ -346,7 +375,18 @@ pub const Connection = struct {
         fn flush(io_w: *Io.Writer) Io.Writer.Error!void {
             const w: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
             try Io.Writer.defaultFlush(io_w);
-            w.conn.output.flush() catch return w.conn.failTransportWrite(error.WriteFailed);
+            w.conn.output.flush() catch {
+                w.conn.err = .transport_write;
+                w.err = w.conn.failure();
+                return error.WriteFailed;
+            };
+        }
+
+        fn encryptAll(w: *Writer, bytes: []const u8) Io.Writer.Error!void {
+            w.conn.encryptAll(bytes) catch |err| {
+                w.err = w.conn.failure();
+                return err;
+            };
         }
     };
 

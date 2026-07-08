@@ -8,6 +8,20 @@ const test_cert_pem = @embedFile("testdata/cert.pem");
 const test_key_pem = @embedFile("testdata/key.pem");
 
 const TestServer = struct {
+    /// Accepts one connection, completes the TLS handshake, then drops the
+    /// TCP connection without sending close_notify.
+    fn abruptClose(io: Io, listener: *Io.net.Server, opt: anytls.config.Server) anyerror!void {
+        var stream = try listener.accept(io);
+        defer stream.close(io);
+        var in_buf: [4096]u8 = undefined;
+        var out_buf: [4096]u8 = undefined;
+        var stream_reader = stream.reader(io, &in_buf);
+        var stream_writer = stream.writer(io, &out_buf);
+
+        var conn = try anytls.server(&stream_reader.interface, &stream_writer.interface, opt);
+        conn.deinit();
+    }
+
     /// Accepts one connection and TLS-echoes back to the client until clean close.
     fn echo(io: Io, listener: *Io.net.Server, opt: anytls.config.Server) anyerror!void {
         var stream = try listener.accept(io);
@@ -43,6 +57,10 @@ const ClientEnd = struct {
     out_buf: [4096]u8,
 
     fn start(env: *ClientEnd, gpa: std.mem.Allocator, server_opt: anytls.config.Server) !void {
+        return env.startWith(TestServer.echo, gpa, server_opt);
+    }
+
+    fn startWith(env: *ClientEnd, comptime server_fn: anytype, gpa: std.mem.Allocator, server_opt: anytls.config.Server) !void {
         env.threaded = .init(gpa, .{});
         errdefer env.threaded.deinit();
         const io = env.threaded.io();
@@ -53,7 +71,7 @@ const ClientEnd = struct {
         errdefer env.listener.deinit(io);
 
         env.server_done = false;
-        env.server_future = try io.concurrent(TestServer.echo, .{ io, &env.listener, server_opt });
+        env.server_future = try io.concurrent(server_fn, .{ io, &env.listener, server_opt });
         errdefer {
             env.server_done = true;
             env.server_future.cancel(io) catch {};
@@ -186,6 +204,31 @@ test "insecure_skip_verify connects despite unknown CA and wrong host" {
     try testing.expectEqualStrings("ping", buf[0..n]);
     try conn.close();
     try env.awaitServer();
+}
+
+test "truncation sets Reader.err" {
+    var env: ClientEnd = undefined;
+    try env.startWith(TestServer.abruptClose, testing.allocator, .{
+        .auth = .{ .cert_pem = test_cert_pem, .key_pem = test_key_pem },
+    });
+    defer env.stop();
+    const input, const output = env.transport();
+
+    var conn = try anytls.client(input, output, .{
+        .host = "localhost",
+        .root_ca = .{ .pem = test_cert_pem },
+    });
+    defer conn.deinit();
+    try env.awaitServer();
+
+    // The server dropped TCP without close_notify: not a clean end of
+    // stream, and the reason is recoverable from the reader per std.Io
+    // convention.
+    var rd_buf: [256]u8 = undefined;
+    var tls_reader = conn.reader(&rd_buf);
+    try testing.expectError(error.ReadFailed, tls_reader.interface.takeByte());
+    try testing.expectEqual(error.TlsTruncated, tls_reader.err.?);
+    try testing.expectEqual(anytls.Connection.ErrorCause.truncated, conn.err.?);
 }
 
 test "large transfer with small buffers" {

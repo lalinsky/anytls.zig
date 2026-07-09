@@ -278,6 +278,10 @@ pub const Connection = struct {
         c.SSL_get0_alpn_selected(conn.ssl, &data, &len);
         if (len > 0) conn.alpn_protocol = data[0..len];
     }
+
+    pub fn alpnProtocol(conn: *const Connection) ?[]const u8 {
+        return conn.alpn_protocol;
+    }
 };
 
 fn initClient(input: *Io.Reader, output: *Io.Writer, opt: common.config.Client) common.InitError!Connection {

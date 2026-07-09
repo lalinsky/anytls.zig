@@ -36,7 +36,7 @@ pub fn client(io: Io, input: *Io.Reader, output: *Io.Writer, opt: common.config.
         .rng = rng_source.interface(),
         .now = Io.Clock.real.now(io),
     }) catch |err| return mapHandshakeError(err);
-    return .{ .impl = conn, .alpn_protocol = conn.alpn_protocol };
+    return .{ .impl = conn };
 }
 
 pub fn server(io: Io, input: *Io.Reader, output: *Io.Writer, opt: common.config.Server) Error!Connection {
@@ -73,7 +73,7 @@ pub fn server(io: Io, input: *Io.Reader, output: *Io.Writer, opt: common.config.
         .rng = rng_source.interface(),
         .now = Io.Clock.real.now(io),
     }) catch |err| return mapHandshakeError(err);
-    return .{ .impl = conn, .alpn_protocol = conn.alpn_protocol };
+    return .{ .impl = conn };
 }
 
 pub const Connection = struct {
@@ -133,6 +133,10 @@ pub const Connection = struct {
         };
     }
 
+    pub fn alpnProtocol(conn: *const Connection) ?[]const u8 {
+        return conn.impl.alpn_protocol;
+    }
+
     fn setErr(conn: *Connection, err: anytype) void {
         // == instead of switch: switch prongs must be members of the call
         // site's inferred error set, which varies across tls.zig versions.
@@ -152,12 +156,14 @@ fn certKeyPairFromPem(
     kp: common.config.CertKeyPair,
 ) common.InitError!tls.config.CertKeyPair {
     return tls.config.CertKeyPair.fromSlice(gpa, io, kp.cert_pem, kp.key_pem) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        // Key parse errors surface from PrivateKey.parsePem before the
-        // certificate bundle is touched; anything else is the bundle.
-        const name = @errorName(err);
-        if (std.mem.indexOf(u8, name, "Certificate") != null) return error.InvalidCertificate;
-        return error.InvalidPrivateKey;
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            inline else => |e| {
+                if (comptime std.mem.startsWith(u8, @errorName(e), "Certificate"))
+                    return error.InvalidCertificate;
+                return error.InvalidPrivateKey;
+            },
+        }
     };
 }
 
@@ -166,11 +172,10 @@ fn mapHandshakeError(err: anytype) common.HandshakeError {
         error.ReadFailed => return error.ReadFailed,
         error.WriteFailed => return error.WriteFailed,
         error.EndOfStream => return error.TlsHandshakeFailure,
-        else => {},
+        inline else => |e| {
+            if (comptime std.mem.startsWith(u8, @errorName(e), "Certificate"))
+                return error.CertificateVerificationFailure;
+            return error.TlsHandshakeFailure;
+        }
     }
-    // Chain and host name verification errors come from std.crypto and all
-    // start with "Certificate".
-    if (std.mem.startsWith(u8, @errorName(err), "Certificate"))
-        return error.CertificateVerificationFailure;
-    return error.TlsHandshakeFailure;
 }

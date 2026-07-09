@@ -1,9 +1,11 @@
 .{
     .name = .anytls,
     .version = "0.1.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .tls = .{ .path = "../tls.zig" },
+    },
     .fingerprint = 0x11e39fc7aac7a26e,
-    .minimum_zig_version = "0.17.0-dev.704+b8cb78023",
+    .minimum_zig_version = "0.16.0",
     .paths = .{
         "build.zig",
         "build.zig.zon",

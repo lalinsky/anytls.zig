@@ -7,18 +7,22 @@ const anytls = @import("root.zig");
 const test_cert_pem = @embedFile("testdata/cert.pem");
 const test_key_pem = @embedFile("testdata/key.pem");
 
+// The tls_zig backend does not report ALPN on client connections (upstream
+// limitation); tests asserting it are skipped there.
+const has_client_alpn = anytls.backend != .tls_zig;
+
 const TestServer = struct {
     /// Accepts one connection, completes the TLS handshake, then drops the
     /// TCP connection without sending close_notify.
     fn abruptClose(io: Io, listener: *Io.net.Server, opt: anytls.config.Server) anyerror!void {
         var stream = try listener.accept(io);
         defer stream.close(io);
-        var in_buf: [4096]u8 = undefined;
-        var out_buf: [4096]u8 = undefined;
+        var in_buf: [anytls.input_buffer_len]u8 = undefined;
+        var out_buf: [anytls.output_buffer_len]u8 = undefined;
         var stream_reader = stream.reader(io, &in_buf);
         var stream_writer = stream.writer(io, &out_buf);
 
-        var conn = try anytls.server(&stream_reader.interface, &stream_writer.interface, opt);
+        var conn = try anytls.server(io, &stream_reader.interface, &stream_writer.interface, opt);
         conn.deinit();
     }
 
@@ -26,12 +30,12 @@ const TestServer = struct {
     fn echo(io: Io, listener: *Io.net.Server, opt: anytls.config.Server) anyerror!void {
         var stream = try listener.accept(io);
         defer stream.close(io);
-        var in_buf: [4096]u8 = undefined;
-        var out_buf: [4096]u8 = undefined;
+        var in_buf: [anytls.input_buffer_len]u8 = undefined;
+        var out_buf: [anytls.output_buffer_len]u8 = undefined;
         var stream_reader = stream.reader(io, &in_buf);
         var stream_writer = stream.writer(io, &out_buf);
 
-        var conn = try anytls.server(&stream_reader.interface, &stream_writer.interface, opt);
+        var conn = try anytls.server(io, &stream_reader.interface, &stream_writer.interface, opt);
         defer conn.deinit();
 
         var buf: [1024]u8 = undefined;
@@ -53,8 +57,8 @@ const ClientEnd = struct {
     stream_writer: Io.net.Stream.Writer,
     server_future: Io.Future(anyerror!void),
     server_done: bool,
-    in_buf: [4096]u8,
-    out_buf: [4096]u8,
+    in_buf: [anytls.input_buffer_len]u8,
+    out_buf: [anytls.output_buffer_len]u8,
 
     fn start(env: *ClientEnd, gpa: std.mem.Allocator, server_opt: anytls.config.Server) !void {
         return env.startWith(TestServer.echo, gpa, server_opt);
@@ -105,18 +109,20 @@ test "handshake, echo, ALPN, clean close" {
     try env.start(testing.allocator, .{
         .auth = .{ .cert_pem = test_cert_pem, .key_pem = test_key_pem },
         .alpn_protocols = &.{ "h2", "http/1.1" },
+        .allocator = testing.allocator,
     });
     defer env.stop();
     const input, const output = env.transport();
 
-    var conn = try anytls.client(input, output, .{
+    var conn = try anytls.client(env.io, input, output, .{
         .host = "localhost",
+        .allocator = testing.allocator,
         .root_ca = .{ .pem = test_cert_pem },
         .alpn_protocols = &.{ "h2", "http/1.1" },
     });
     defer conn.deinit();
 
-    try testing.expectEqualStrings("h2", conn.alpn_protocol.?);
+    if (has_client_alpn) try testing.expectEqualStrings("h2", conn.alpnProtocol().?);
 
     // Direct read/write methods.
     try conn.writeAll("hello over tls");
@@ -141,28 +147,31 @@ test "handshake, echo, ALPN, clean close" {
 
     try conn.close();
     // Server saw close_notify, echoed everything, and exited cleanly.
+    // Whether the peer replies with its own close_notify is not part of the
+    // contract, so nothing is read after close.
     try env.awaitServer();
-    // Our side then reads the server's close_notify as clean EOF.
-    try testing.expectEqual(@as(usize, 0), try conn.read(&buf));
 }
 
 test "server picks its preference order for ALPN" {
+    if (!has_client_alpn) return error.SkipZigTest;
     var env: ClientEnd = undefined;
     try env.start(testing.allocator, .{
         .auth = .{ .cert_pem = test_cert_pem, .key_pem = test_key_pem },
         .alpn_protocols = &.{"http/1.1"},
+        .allocator = testing.allocator,
     });
     defer env.stop();
     const input, const output = env.transport();
 
-    var conn = try anytls.client(input, output, .{
+    var conn = try anytls.client(env.io, input, output, .{
         .host = "localhost",
+        .allocator = testing.allocator,
         .root_ca = .{ .pem = test_cert_pem },
         .alpn_protocols = &.{ "h2", "http/1.1" },
     });
     defer conn.deinit();
 
-    try testing.expectEqualStrings("http/1.1", conn.alpn_protocol.?);
+    try testing.expectEqualStrings("http/1.1", conn.alpnProtocol().?);
     try conn.close();
     try env.awaitServer();
 }
@@ -171,28 +180,32 @@ test "certificate verification failure without trust anchor" {
     var env: ClientEnd = undefined;
     try env.start(testing.allocator, .{
         .auth = .{ .cert_pem = test_cert_pem, .key_pem = test_key_pem },
+        .allocator = testing.allocator,
     });
     defer env.stop();
     const input, const output = env.transport();
 
-    try testing.expectError(error.CertificateVerificationFailure, anytls.client(input, output, .{
+    try testing.expectError(error.CertificateVerificationFailure, anytls.client(env.io, input, output, .{
         .host = "localhost",
+        .allocator = testing.allocator,
         .root_ca = .none,
     }));
-    // The server side fails too (it receives the client's fatal alert).
-    try testing.expectError(error.TlsHandshakeFailure, env.awaitServer());
+    // What the server side observes (fatal alert vs. bare EOF vs. still
+    // blocked reading) is backend-dependent; env.stop() cancels it.
 }
 
 test "insecure_skip_verify connects despite unknown CA and wrong host" {
     var env: ClientEnd = undefined;
     try env.start(testing.allocator, .{
         .auth = .{ .cert_pem = test_cert_pem, .key_pem = test_key_pem },
+        .allocator = testing.allocator,
     });
     defer env.stop();
     const input, const output = env.transport();
 
-    var conn = try anytls.client(input, output, .{
+    var conn = try anytls.client(env.io, input, output, .{
         .host = "does-not-match.example.com",
+        .allocator = testing.allocator,
         .root_ca = .none,
         .insecure_skip_verify = true,
     });
@@ -210,12 +223,14 @@ test "truncation sets Reader.err" {
     var env: ClientEnd = undefined;
     try env.startWith(TestServer.abruptClose, testing.allocator, .{
         .auth = .{ .cert_pem = test_cert_pem, .key_pem = test_key_pem },
+        .allocator = testing.allocator,
     });
     defer env.stop();
     const input, const output = env.transport();
 
-    var conn = try anytls.client(input, output, .{
+    var conn = try anytls.client(env.io, input, output, .{
         .host = "localhost",
+        .allocator = testing.allocator,
         .root_ca = .{ .pem = test_cert_pem },
     });
     defer conn.deinit();
@@ -228,19 +243,21 @@ test "truncation sets Reader.err" {
     var tls_reader = conn.reader(&rd_buf);
     try testing.expectError(error.ReadFailed, tls_reader.interface.takeByte());
     try testing.expectEqual(error.TlsTruncated, tls_reader.err.?);
-    try testing.expectEqual(anytls.Connection.ErrorCause.truncated, conn.err.?);
+    try testing.expectEqual(error.TlsTruncated, conn.failure().?);
 }
 
 test "large transfer with small buffers" {
     var env: ClientEnd = undefined;
     try env.start(testing.allocator, .{
         .auth = .{ .cert_pem = test_cert_pem, .key_pem = test_key_pem },
+        .allocator = testing.allocator,
     });
     defer env.stop();
     const input, const output = env.transport();
 
-    var conn = try anytls.client(input, output, .{
+    var conn = try anytls.client(env.io, input, output, .{
         .host = "localhost",
+        .allocator = testing.allocator,
         .root_ca = .{ .pem = test_cert_pem },
     });
     defer conn.deinit();

@@ -105,19 +105,3 @@ reader/writer interfaces, the same value is stored in `reader.err`/`writer.err`.
 
 A transport that ends without close_notify is reported as `error.ReadFailed`
 with `failure() == error.TlsTruncated`, not as a clean end of stream.
-
-## Backends
-
-|                       | `openssl`             | `tls_zig`         |
-| --------------------- | --------------------- | ----------------- |
-| implementation        | system libssl         | pure Zig          |
-| client                | TLS 1.2, 1.3          | TLS 1.2, 1.3      |
-| server                | TLS 1.2, 1.3          | TLS 1.3           |
-| ALPN                  | yes                   | server side only¹ |
-| client authentication | yes                   | yes               |
-
-¹ tls_zig negotiates ALPN on client connections, but `alpnProtocol()`
-returns null there.
-
-Tests run against both backends: `zig build test` and
-`zig build test -Dbackend=tls_zig`.

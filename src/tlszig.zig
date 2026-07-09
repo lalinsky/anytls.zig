@@ -1,9 +1,3 @@
-//! Pure Zig backend using ianic/tls.zig.
-//!
-//! `io` supplies what tls.zig needs explicitly: randomness and wall-clock
-//! time. Certificate and key parsing require an allocator
-//! (`config.*.allocator`); the parsed material is only needed during the
-//! handshake and is freed before returning.
 const std = @import("std");
 const Io = std.Io;
 const tls = @import("tls");
@@ -42,11 +36,7 @@ pub fn client(io: Io, input: *Io.Reader, output: *Io.Writer, opt: common.config.
         .rng = rng_source.interface(),
         .now = Io.Clock.real.now(io),
     }) catch |err| return mapHandshakeError(err);
-    // Note: conn.alpn_protocol is NOT propagated. tls.client() copies the
-    // negotiated name into a handshake struct that lives on its own stack
-    // frame, so the slice dangles by the time it returns; reading it is UB.
-    // Client-side ALPN reports null until that is fixed upstream.
-    return .{ .impl = conn };
+    return .{ .impl = conn, .alpn_protocol = conn.alpn_protocol };
 }
 
 pub fn server(io: Io, input: *Io.Reader, output: *Io.Writer, opt: common.config.Server) Error!Connection {
@@ -72,7 +62,6 @@ pub fn server(io: Io, input: *Io.Reader, output: *Io.Writer, opt: common.config.
 
     const conn = tls.server(input, output, .{
         .auth = &auth,
-        // Anonymous literal: tls.zig does not re-export its ClientAuth type.
         .client_auth = if (opt.client_auth) |ca| .{
             .root_ca = client_root_ca,
             .auth_type = switch (ca.auth_type) {
@@ -84,8 +73,6 @@ pub fn server(io: Io, input: *Io.Reader, output: *Io.Writer, opt: common.config.
         .rng = rng_source.interface(),
         .now = Io.Clock.real.now(io),
     }) catch |err| return mapHandshakeError(err);
-    // Server-side ALPN is safe to expose: the handshake selects an element
-    // of opt.alpn_protocols, which the caller owns.
     return .{ .impl = conn, .alpn_protocol = conn.alpn_protocol };
 }
 
@@ -102,10 +89,6 @@ pub const Connection = struct {
 
     pub fn errorMessage(conn: *const Connection) []const u8 {
         return conn.err_name;
-    }
-
-    pub fn alpnProtocol(conn: *const Connection) ?[]const u8 {
-        return conn.alpn_protocol;
     }
 
     /// tls.zig holds no resources outside the caller-provided buffers.

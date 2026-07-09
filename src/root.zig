@@ -92,11 +92,9 @@ pub const Connection = struct {
     }
 
     /// ALPN protocol negotiated during the handshake, null if none.
-    /// Valid until `deinit`. Note: the tls_zig backend reports it only on
-    /// server connections; client connections return null (upstream
-    /// limitation).
+    /// Valid until `deinit`.
     pub fn alpnProtocol(conn: *const Connection) ?[]const u8 {
-        return conn.impl.alpnProtocol();
+        return conn.impl.alpn_protocol;
     }
 
     /// Why the most recent read/write/close failed; null if none has.

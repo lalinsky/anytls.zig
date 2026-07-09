@@ -1,11 +1,3 @@
-//! libssl (OpenSSL 3) backend.
-//!
-//! libssl runs sans-I/O on a pair of memory BIOs and never blocks: every
-//! `SSL_*` call is a pure in-memory transform. All actual transport I/O — and
-//! therefore every suspension point — happens in this file's Zig code, with
-//! no OpenSSL stack frames live. This makes connections safe for green-thread
-//! `Io` implementations where a fiber may resume on a different OS thread
-//! (OpenSSL's error queue is thread-local).
 const std = @import("std");
 const Io = std.Io;
 const c = @import("c");
@@ -42,11 +34,8 @@ pub fn server(io: Io, input: *Io.Reader, output: *Io.Writer, opt: common.config.
 pub const Connection = struct {
     ssl: *c.SSL,
     ctx: *c.SSL_CTX,
-    /// Ciphertext from the peer, waiting to be consumed by libssl. Owned by `ssl`.
     rbio: *c.BIO,
-    /// Ciphertext produced by libssl, waiting to be sent to the peer. Owned by `ssl`.
     wbio: *c.BIO,
-    /// Transport the encrypted stream is read from / written to.
     input: *Io.Reader,
     output: *Io.Writer,
 
@@ -68,10 +57,6 @@ pub const Connection = struct {
 
     pub fn errorMessage(conn: *const Connection) []const u8 {
         return conn.err_buf[0..conn.err_len];
-    }
-
-    pub fn alpnProtocol(conn: *const Connection) ?[]const u8 {
-        return conn.alpn_protocol;
     }
 
     /// Frees libssl resources. Does not close the underlying transport.

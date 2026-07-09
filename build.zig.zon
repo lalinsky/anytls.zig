@@ -2,7 +2,10 @@
     .name = .anytls,
     .version = "0.1.0",
     .dependencies = .{
-        .tls = .{ .path = "../tls.zig" },
+        .tls = .{
+            .url = "https://github.com/ianic/tls.zig/archive/819ae168d4ea191a768fa1542d66f31f2dcb8327.tar.gz",
+            .hash = "tls-0.1.0-ER2e0pGrBQDyyQ14DfnO03olbgccQGv_lwpUcUmizHcG",
+        },
     },
     .fingerprint = 0x11e39fc7aac7a26e,
     .minimum_zig_version = "0.16.0",

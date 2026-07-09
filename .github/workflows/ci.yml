@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        optimize: [Debug, ReleaseSafe]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Test (openssl backend)
+        run: zig build test -Doptimize=${{ matrix.optimize }} --summary all
+
+      - name: Test (tls_zig backend)
+        run: zig build test -Dbackend=tls_zig -Doptimize=${{ matrix.optimize }} --summary all

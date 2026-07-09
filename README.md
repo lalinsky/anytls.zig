@@ -15,6 +15,11 @@ task may resume on a different OS thread.
 
 > Work in progress. Requires Zig 0.16.
 
+Things to do:
+
+- [ ] better error handling
+- [ ] better root CA bundle handling
+
 [ianic/tls.zig]: https://github.com/ianic/tls.zig
 [zio]: https://github.com/lalinsky/zio
 [`std.Io.Reader`]: https://ziglang.org/documentation/0.16.0/std/#std.Io.Reader

@@ -71,8 +71,10 @@ try conn.writeAll("GET / HTTP/1.0\r\nHost: example.com\r\n\r\n");
 
 var buf: [4096]u8 = undefined;
 while (true) {
-    const n = try conn.read(&buf);
-    if (n == 0) break; // peer sent close_notify
+    const n = conn.read(&buf) catch |err| switch (err) {
+        error.EndOfStream => break, // peer sent close_notify
+        else => |e| return e,
+    };
     // use buf[0..n]
 }
 ```

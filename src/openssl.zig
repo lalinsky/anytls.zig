@@ -111,11 +111,13 @@ pub const Connection = struct {
     }
 
     /// Reads decrypted data into `buffer`. Returns the number of bytes read;
-    /// 0 means the peer closed the connection cleanly (close_notify
-    /// received). A transport end of stream without close_notify is reported
-    /// as `error.ReadFailed` with `err == error.TlsTruncated`.
-    pub fn read(conn: *Connection, buffer: []u8) error{ReadFailed}!usize {
-        if (buffer.len == 0 or conn.read_closed) return 0;
+    /// 0 means no application data was available this call, not end of
+    /// stream. A clean shutdown (close_notify) is reported as
+    /// `error.EndOfStream`; a transport end of stream without close_notify is
+    /// reported as `error.ReadFailed` with `err == error.TlsTruncated`.
+    pub fn read(conn: *Connection, buffer: []u8) error{ ReadFailed, EndOfStream }!usize {
+        if (conn.read_closed) return error.EndOfStream;
+        if (buffer.len == 0) return 0;
         while (true) {
             c.ERR_clear_error();
             var n: usize = 0;
@@ -129,7 +131,7 @@ pub const Connection = struct {
             switch (c.SSL_get_error(conn.ssl, rc)) {
                 c.SSL_ERROR_ZERO_RETURN => {
                     conn.read_closed = true;
-                    return 0;
+                    return error.EndOfStream;
                 },
                 c.SSL_ERROR_WANT_READ => {
                     conn.moveOutgoing() catch return conn.failTransportWrite(error.ReadFailed);

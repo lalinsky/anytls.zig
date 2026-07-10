@@ -79,10 +79,6 @@ pub fn server(io: Io, input: *Io.Reader, output: *Io.Writer, opt: common.config.
 pub const Connection = struct {
     impl: tls.Connection,
 
-    /// Negotiated ALPN protocol. Always null for client connections: see
-    /// the note in `client` about the upstream slice lifetime bug.
-    alpn_protocol: ?[]const u8 = null,
-
     /// The most recent failure; underlying error name in `errorMessage`.
     err: ?common.Failure = null,
     err_name: []const u8 = "",
@@ -97,18 +93,20 @@ pub const Connection = struct {
     }
 
     /// Reads decrypted data into `buffer`. Returns the number of bytes read;
-    /// 0 means the peer closed the connection cleanly (close_notify
-    /// received). A transport end of stream without close_notify is reported
-    /// as `error.ReadFailed` with `err == error.TlsTruncated`.
-    pub fn read(conn: *Connection, buffer: []u8) error{ReadFailed}!usize {
+    /// 0 means no application data was available this call, not end of
+    /// stream. A clean shutdown (close_notify) is reported as
+    /// `error.EndOfStream`; a transport end of stream without close_notify is
+    /// reported as `error.ReadFailed` with `err == error.TlsTruncated`.
+    pub fn read(conn: *Connection, buffer: []u8) error{ ReadFailed, EndOfStream }!usize {
         if (buffer.len == 0) return 0;
         const n = conn.impl.read(buffer) catch |err| {
             conn.setErr(err);
             return error.ReadFailed;
         };
-        // tls.zig reports transport EOF as a clean end of stream; only a
-        // received close_notify counts as one for us.
-        if (n == 0 and !conn.impl.eof()) {
+        if (n == 0) {
+            // eof() distinguishes a received close_notify from a transport
+            // EOF without one (truncation).
+            if (conn.impl.eof()) return error.EndOfStream;
             conn.err = error.TlsTruncated;
             conn.err_name = "EndOfStream";
             return error.ReadFailed;

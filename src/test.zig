@@ -40,8 +40,10 @@ const TestServer = struct {
 
         var buf: [1024]u8 = undefined;
         while (true) {
-            const n = try conn.read(&buf);
-            if (n == 0) break; // clean close_notify
+            const n = conn.read(&buf) catch |err| switch (err) {
+                error.EndOfStream => break, // clean close_notify
+                else => |e| return e,
+            };
             try conn.writeAll(buf[0..n]);
         }
         try conn.close();

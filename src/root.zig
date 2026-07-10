@@ -64,11 +64,17 @@ pub const Connection = struct {
     /// functionality is available here behind `comptime` checks.
     impl: impl.Connection,
 
-    /// Reads decrypted data into `buffer`. Returns the number of bytes read;
-    /// 0 means the peer closed the connection cleanly (close_notify
-    /// received). A transport end of stream without close_notify is
-    /// reported as `error.ReadFailed` with `failure() == error.TlsTruncated`.
-    pub fn read(conn: *Connection, buffer: []u8) error{ReadFailed}!usize {
+    /// Reads decrypted data into `buffer`. Returns the number of bytes read.
+    /// A return of 0 means no application data was available this call (for
+    /// example `buffer` was empty, or only post-handshake messages were
+    /// processed); it does *not* signal end of stream, and the caller may
+    /// read again.
+    ///
+    /// A clean shutdown (close_notify received) is reported as
+    /// `error.EndOfStream`; once seen, every subsequent read returns it too.
+    /// A transport end of stream without close_notify is reported as
+    /// `error.ReadFailed` with `failure() == error.TlsTruncated`.
+    pub fn read(conn: *Connection, buffer: []u8) error{ ReadFailed, EndOfStream }!usize {
         return conn.impl.read(buffer);
     }
 
@@ -142,11 +148,13 @@ pub const Connection = struct {
         fn stream(io_r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
             const r: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
             const dest = limit.slice(try w.writableSliceGreedy(1));
-            const n = r.conn.read(dest) catch |err| {
-                r.err = r.conn.failure() orelse error.TlsFailure;
-                return err;
+            const n = r.conn.read(dest) catch |err| switch (err) {
+                error.EndOfStream => return error.EndOfStream,
+                error.ReadFailed => {
+                    r.err = r.conn.failure() orelse error.TlsFailure;
+                    return error.ReadFailed;
+                },
             };
-            if (n == 0) return error.EndOfStream;
             w.advance(n);
             return n;
         }

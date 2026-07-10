@@ -45,8 +45,9 @@ pub const Connection = struct {
     /// into SSL-owned memory; valid until `deinit`.
     alpn_protocol: ?[]const u8 = null,
 
-    /// The most recent failure; message in `errorMessage`.
-    err: ?common.Failure = null,
+    /// The most recent failure, named after tls.zig's vocabulary; message in
+    /// `errorMessage`.
+    err: ?anyerror = null,
     err_buf: [256]u8 = undefined,
     err_len: usize = 0,
 
@@ -72,28 +73,27 @@ pub const Connection = struct {
             c.ERR_clear_error();
             const rc = c.SSL_do_handshake(conn.ssl);
             if (rc == 1) {
-                conn.moveOutgoing() catch return conn.failTransportWrite(error.WriteFailed);
-                conn.output.flush() catch return conn.failTransportWrite(error.WriteFailed);
+                conn.moveOutgoing() catch return error.WriteFailed;
+                conn.output.flush() catch return error.WriteFailed;
                 conn.captureAlpn();
                 return;
             }
             switch (c.SSL_get_error(conn.ssl, rc)) {
                 c.SSL_ERROR_WANT_READ => {
-                    conn.moveOutgoing() catch return conn.failTransportWrite(error.WriteFailed);
+                    conn.moveOutgoing() catch return error.WriteFailed;
                     conn.fillIncoming() catch |fill_err| switch (fill_err) {
+                        // A transport failure is recorded on the caller's
+                        // reader/writer; only truncation is ours to report.
                         error.EndOfStream => {
-                            conn.err = error.TlsTruncated;
+                            conn.err = error.TlsConnectionTruncated;
                             return error.TlsHandshakeFailure;
                         },
-                        error.ReadFailed => {
-                            conn.err = error.TransportReadFailed;
-                            return error.ReadFailed;
-                        },
-                        error.WriteFailed => return conn.failTransportWrite(error.WriteFailed),
+                        error.ReadFailed => return error.ReadFailed,
+                        error.WriteFailed => return error.WriteFailed,
                     };
                 },
                 c.SSL_ERROR_WANT_WRITE => {
-                    conn.moveOutgoing() catch return conn.failTransportWrite(error.WriteFailed);
+                    conn.moveOutgoing() catch return error.WriteFailed;
                 },
                 else => {
                     const verify_failed = conn.captureVerifyFailure();
@@ -114,7 +114,7 @@ pub const Connection = struct {
     /// 0 means no application data was available this call, not end of
     /// stream. A clean shutdown (close_notify) is reported as
     /// `error.EndOfStream`; a transport end of stream without close_notify is
-    /// reported as `error.ReadFailed` with `err == error.TlsTruncated`.
+    /// reported as `error.ReadFailed` with `err == error.TlsConnectionTruncated`.
     pub fn read(conn: *Connection, buffer: []u8) error{ ReadFailed, EndOfStream }!usize {
         if (conn.read_closed) return error.EndOfStream;
         if (buffer.len == 0) return 0;
@@ -125,7 +125,7 @@ pub const Connection = struct {
             if (rc == 1) {
                 // TLS 1.3 reads can produce output (session tickets,
                 // KeyUpdate responses); park it in the transport buffer.
-                conn.moveOutgoing() catch return conn.failTransportWrite(error.ReadFailed);
+                conn.moveOutgoing() catch return error.ReadFailed;
                 return n;
             }
             switch (c.SSL_get_error(conn.ssl, rc)) {
@@ -134,21 +134,20 @@ pub const Connection = struct {
                     return error.EndOfStream;
                 },
                 c.SSL_ERROR_WANT_READ => {
-                    conn.moveOutgoing() catch return conn.failTransportWrite(error.ReadFailed);
+                    conn.moveOutgoing() catch return error.ReadFailed;
                     conn.fillIncoming() catch |fill_err| switch (fill_err) {
+                        // A transport failure is recorded on the caller's
+                        // reader/writer; only truncation is ours to report.
                         error.EndOfStream => {
-                            conn.err = error.TlsTruncated;
+                            conn.err = error.TlsConnectionTruncated;
                             return error.ReadFailed;
                         },
-                        error.ReadFailed => {
-                            conn.err = error.TransportReadFailed;
-                            return error.ReadFailed;
-                        },
-                        error.WriteFailed => return conn.failTransportWrite(error.ReadFailed),
+                        error.ReadFailed => return error.ReadFailed,
+                        error.WriteFailed => return error.ReadFailed,
                     };
                 },
                 c.SSL_ERROR_WANT_WRITE => {
-                    conn.moveOutgoing() catch return conn.failTransportWrite(error.ReadFailed);
+                    conn.moveOutgoing() catch return error.ReadFailed;
                 },
                 else => {
                     conn.captureSslError();
@@ -161,7 +160,7 @@ pub const Connection = struct {
     /// Encrypts and sends `bytes`, flushing the transport.
     pub fn writeAll(conn: *Connection, bytes: []const u8) error{WriteFailed}!void {
         try conn.encryptAll(bytes);
-        conn.output.flush() catch return conn.failTransportWrite(error.WriteFailed);
+        conn.output.flush() catch return error.WriteFailed;
     }
 
     /// Sends close_notify and flushes the transport. Does not wait for the
@@ -169,8 +168,8 @@ pub const Connection = struct {
     pub fn close(conn: *Connection) error{WriteFailed}!void {
         c.ERR_clear_error();
         _ = c.SSL_shutdown(conn.ssl);
-        conn.moveOutgoing() catch return conn.failTransportWrite(error.WriteFailed);
-        conn.output.flush() catch return conn.failTransportWrite(error.WriteFailed);
+        conn.moveOutgoing() catch return error.WriteFailed;
+        conn.output.flush() catch return error.WriteFailed;
     }
 
     /// Encrypts `bytes` into the transport writer buffer without flushing
@@ -184,24 +183,22 @@ pub const Connection = struct {
             const rc = c.SSL_write_ex(conn.ssl, chunk.ptr, chunk.len, &written);
             if (rc == 1) {
                 off += written;
-                conn.moveOutgoing() catch return conn.failTransportWrite(error.WriteFailed);
+                conn.moveOutgoing() catch return error.WriteFailed;
                 continue;
             }
             switch (c.SSL_get_error(conn.ssl, rc)) {
                 c.SSL_ERROR_WANT_READ => {
                     // Post-handshake message (e.g. rekey) must be read first.
-                    conn.moveOutgoing() catch return conn.failTransportWrite(error.WriteFailed);
+                    conn.moveOutgoing() catch return error.WriteFailed;
                     conn.fillIncoming() catch |fill_err| {
-                        conn.err = switch (fill_err) {
-                            error.EndOfStream => error.TlsTruncated,
-                            error.ReadFailed => error.TransportReadFailed,
-                            error.WriteFailed => error.TransportWriteFailed,
-                        };
+                        // Transport failures live on the caller's reader/writer;
+                        // only truncation is ours to report.
+                        if (fill_err == error.EndOfStream) conn.err = error.TlsConnectionTruncated;
                         return error.WriteFailed;
                     };
                 },
                 c.SSL_ERROR_WANT_WRITE => {
-                    conn.moveOutgoing() catch return conn.failTransportWrite(error.WriteFailed);
+                    conn.moveOutgoing() catch return error.WriteFailed;
                 },
                 else => {
                     conn.captureSslError();
@@ -244,7 +241,9 @@ pub const Connection = struct {
     /// a suspension may migrate the fiber to another OS thread, and the
     /// error queue is thread-local.
     fn captureSslError(conn: *Connection) void {
-        conn.err = error.TlsFailure;
+        // Coarse: OpenSSL does not hand back a tls.zig-style category here, so
+        // the specific cause stays in `err_buf` (see `errorMessage`).
+        conn.err = error.TlsUnexpectedMessage;
         const e = c.ERR_get_error();
         if (e != 0) {
             c.ERR_error_string_n(e, &conn.err_buf, conn.err_buf.len);
@@ -260,18 +259,13 @@ pub const Connection = struct {
     fn captureVerifyFailure(conn: *Connection) bool {
         const vr = c.SSL_get_verify_result(conn.ssl);
         if (vr == c.X509_V_OK) return false;
-        conn.err = error.TlsFailure;
+        conn.err = error.TlsBadCertificate;
         const msg = std.mem.span(c.X509_verify_cert_error_string(vr));
         const n = @min(msg.len, conn.err_buf.len);
         @memcpy(conn.err_buf[0..n], msg[0..n]);
         conn.err_len = n;
         c.ERR_clear_error();
         return true;
-    }
-
-    fn failTransportWrite(conn: *Connection, comptime err: anytype) @TypeOf(err) {
-        conn.err = error.TransportWriteFailed;
-        return err;
     }
 
     fn captureAlpn(conn: *Connection) void {

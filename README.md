@@ -104,11 +104,29 @@ const line = try reader.interface.takeDelimiterInclusive('\n');
 
 ## Error handling
 
-`read`/`writeAll`/`close` return only `error.ReadFailed`/`error.WriteFailed`.
-The reason is available from `conn.failure()` (one of `anytls.Failure`:
-`TlsFailure`, `TlsTruncated`, `TransportReadFailed`, `TransportWriteFailed`)
-and `conn.errorMessage()` gives a best-effort detail string. When using the
-reader/writer interfaces, the same value is stored in `reader.err`/`writer.err`.
+`read` returns `error.ReadFailed`/`error.EndOfStream`; `writeAll`/`close`
+return `error.WriteFailed`. These are deliberately coarse — the actual cause
+lives in a diagnostic field, the same layered convention `std.http` uses over
+TLS.
 
-A transport that ends without close_notify is reported as `error.ReadFailed`
-with `failure() == error.TlsTruncated`, not as a clean end of stream.
+`conn.failure()` (an `?anyerror`, mirrored in `reader.err`/`writer.err`) holds
+the **TLS-layer** reason: a received alert, a bad record, or
+`error.TlsConnectionTruncated` when the transport ended without close_notify.
+The tls_zig backend reports its own `error.Tls*` verbatim; the openssl backend
+maps onto the same names, coarsely, with the precise OpenSSL string in
+`conn.errorMessage()`.
+
+A **transport** failure returns `error.ReadFailed`/`error.WriteFailed` but
+leaves `failure()` null — the underlying cause is on the transport
+reader/writer you passed in. Recover it by falling through:
+
+```zig
+const n = conn.read(&buf) catch |err| switch (err) {
+    error.EndOfStream => break, // clean close_notify
+    error.ReadFailed => return conn.failure() orelse tcp_reader.err.?,
+};
+```
+
+A transport that ends without close_notify is thus `error.ReadFailed` with
+`failure() == error.TlsConnectionTruncated`, distinct from a clean end of
+stream (`error.EndOfStream` returned directly from `read`, `failure()` null).

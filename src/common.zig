@@ -1,19 +1,6 @@
 //! Types shared by the facade and both backends.
 const std = @import("std");
 
-/// Why the most recent operation on an established connection failed.
-/// Stored on the connection and surfaced through `Reader.err`/`Writer.err`.
-pub const Failure = error{
-    /// TLS protocol error (bad record, unexpected message, decrypt
-    /// failure, ...).
-    TlsFailure,
-    /// Transport reached end of stream without a close_notify (possible
-    /// truncation attack).
-    TlsTruncated,
-    TransportReadFailed,
-    TransportWriteFailed,
-};
-
 pub const InitError = error{
     /// Backend object creation or configuration failed.
     TlsInitFailure,

@@ -244,8 +244,8 @@ test "truncation sets Reader.err" {
     var rd_buf: [256]u8 = undefined;
     var tls_reader = conn.reader(&rd_buf);
     try testing.expectError(error.ReadFailed, tls_reader.interface.takeByte());
-    try testing.expectEqual(error.TlsTruncated, tls_reader.err.?);
-    try testing.expectEqual(error.TlsTruncated, conn.failure().?);
+    try testing.expectEqual(error.TlsConnectionTruncated, tls_reader.err.?);
+    try testing.expectEqual(error.TlsConnectionTruncated, conn.failure().?);
 }
 
 test "large transfer with small buffers" {

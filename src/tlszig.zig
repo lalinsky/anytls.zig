@@ -79,12 +79,11 @@ pub fn server(io: Io, input: *Io.Reader, output: *Io.Writer, opt: common.config.
 pub const Connection = struct {
     impl: tls.Connection,
 
-    /// The most recent failure; underlying error name in `errorMessage`.
-    err: ?common.Failure = null,
-    err_name: []const u8 = "",
+    /// The most recent failure: tls.zig's own error, passed through verbatim.
+    err: ?anyerror = null,
 
     pub fn errorMessage(conn: *const Connection) []const u8 {
-        return conn.err_name;
+        return if (conn.err) |e| @errorName(e) else "";
     }
 
     /// tls.zig holds no resources outside the caller-provided buffers.
@@ -96,19 +95,18 @@ pub const Connection = struct {
     /// 0 means no application data was available this call, not end of
     /// stream. A clean shutdown (close_notify) is reported as
     /// `error.EndOfStream`; a transport end of stream without close_notify is
-    /// reported as `error.ReadFailed` with `err == error.TlsTruncated`.
+    /// reported as `error.ReadFailed` with `err == error.TlsConnectionTruncated`.
     pub fn read(conn: *Connection, buffer: []u8) error{ ReadFailed, EndOfStream }!usize {
         if (buffer.len == 0) return 0;
         const n = conn.impl.read(buffer) catch |err| {
-            conn.setErr(err);
+            conn.recordTlsErr(err);
             return error.ReadFailed;
         };
         if (n == 0) {
             // eof() distinguishes a received close_notify from a transport
             // EOF without one (truncation).
             if (conn.impl.eof()) return error.EndOfStream;
-            conn.err = error.TlsTruncated;
-            conn.err_name = "EndOfStream";
+            conn.err = error.TlsConnectionTruncated;
             return error.ReadFailed;
         }
         return n;
@@ -117,7 +115,7 @@ pub const Connection = struct {
     /// Encrypts and sends `bytes`; tls.zig flushes the transport per record.
     pub fn writeAll(conn: *Connection, bytes: []const u8) error{WriteFailed}!void {
         conn.impl.writeAll(bytes) catch |err| {
-            conn.setErr(err);
+            conn.recordTlsErr(err);
             return error.WriteFailed;
         };
     }
@@ -126,7 +124,7 @@ pub const Connection = struct {
     /// Does not close the underlying transport.
     pub fn close(conn: *Connection) error{WriteFailed}!void {
         conn.impl.close() catch |err| {
-            conn.setErr(err);
+            conn.recordTlsErr(err);
             return error.WriteFailed;
         };
     }
@@ -135,16 +133,10 @@ pub const Connection = struct {
         return conn.impl.alpn_protocol;
     }
 
-    fn setErr(conn: *Connection, err: anytype) void {
-        // == instead of switch: switch prongs must be members of the call
-        // site's inferred error set, which varies across tls.zig versions.
-        conn.err = if (err == error.ReadFailed)
-            error.TransportReadFailed
-        else if (err == error.WriteFailed)
-            error.TransportWriteFailed
-        else
-            error.TlsFailure;
-        conn.err_name = @errorName(err);
+    /// Transport failures are recorded on the caller's reader/writer, so store
+    /// only genuine TLS-layer errors here (see root.zig `failure()`).
+    fn recordTlsErr(conn: *Connection, err: anyerror) void {
+        if (err != error.ReadFailed and err != error.WriteFailed) conn.err = err;
     }
 };
 

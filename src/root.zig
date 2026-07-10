@@ -21,7 +21,6 @@ const impl = switch (backend) {
 };
 
 pub const config = common.config;
-pub const Failure = common.Failure;
 pub const InitError = common.InitError;
 pub const HandshakeError = common.HandshakeError;
 pub const ClientError = InitError || HandshakeError;
@@ -73,7 +72,7 @@ pub const Connection = struct {
     /// A clean shutdown (close_notify received) is reported as
     /// `error.EndOfStream`; once seen, every subsequent read returns it too.
     /// A transport end of stream without close_notify is reported as
-    /// `error.ReadFailed` with `failure() == error.TlsTruncated`.
+    /// `error.ReadFailed` with `failure() == error.TlsConnectionTruncated`.
     pub fn read(conn: *Connection, buffer: []u8) error{ ReadFailed, EndOfStream }!usize {
         return conn.impl.read(buffer);
     }
@@ -103,8 +102,24 @@ pub const Connection = struct {
         return conn.impl.alpnProtocol();
     }
 
-    /// Why the most recent read/write/close failed; null if none has.
-    pub fn failure(conn: *const Connection) ?Failure {
+    /// The TLS-layer reason the most recent read/write/close failed, or null.
+    ///
+    /// Only genuine TLS errors are reported here — a received alert, a bad
+    /// record, or `error.TlsConnectionTruncated` (transport ended without
+    /// close_notify). A *transport* failure returns `error.ReadFailed`/
+    /// `error.WriteFailed` but leaves this null; the underlying cause is on
+    /// the caller's transport reader/writer, so recover it the same way
+    /// `std.http` does over TLS:
+    ///
+    ///     conn.read(buf) catch |err| switch (err) {
+    ///         error.ReadFailed => conn.failure() orelse tcp_reader.err.?,
+    ///         ...
+    ///     };
+    ///
+    /// The tls_zig backend reports its own error verbatim; the openssl backend
+    /// maps onto the same names, coarsely (the precise OpenSSL cause stays in
+    /// `errorMessage`).
+    pub fn failure(conn: *const Connection) ?anyerror {
         return conn.impl.err;
     }
 
@@ -129,9 +144,10 @@ pub const Connection = struct {
     pub const Reader = struct {
         conn: *Connection,
         interface: Io.Reader,
-        /// Set when the interface returns error.ReadFailed; details in
-        /// `conn.errorMessage()`.
-        err: ?Failure = null,
+        /// TLS-layer cause after the interface returns error.ReadFailed; see
+        /// `Connection.failure`. Null for a transport-level failure (recover
+        /// it from the underlying transport reader instead).
+        err: ?anyerror = null,
 
         pub fn init(conn: *Connection, buffer: []u8) Reader {
             return .{
@@ -151,7 +167,9 @@ pub const Connection = struct {
             const n = r.conn.read(dest) catch |err| switch (err) {
                 error.EndOfStream => return error.EndOfStream,
                 error.ReadFailed => {
-                    r.err = r.conn.failure() orelse error.TlsFailure;
+                    // Null when the failure was transport-level; the cause is
+                    // then on the caller's transport reader.
+                    r.err = r.conn.failure();
                     return error.ReadFailed;
                 },
             };
@@ -163,9 +181,10 @@ pub const Connection = struct {
     pub const Writer = struct {
         conn: *Connection,
         interface: Io.Writer,
-        /// Set when the interface returns error.WriteFailed; details in
-        /// `conn.errorMessage()`.
-        err: ?Failure = null,
+        /// TLS-layer cause after the interface returns error.WriteFailed; see
+        /// `Connection.failure`. Null for a transport-level failure (recover
+        /// it from the underlying transport writer instead).
+        err: ?anyerror = null,
 
         pub fn init(conn: *Connection, buffer: []u8) Writer {
             return .{
@@ -200,7 +219,9 @@ pub const Connection = struct {
 
         fn writeAll(w: *Writer, bytes: []const u8) Io.Writer.Error!void {
             w.conn.writeAll(bytes) catch |err| {
-                w.err = w.conn.failure() orelse error.TlsFailure;
+                // Null when the failure was transport-level; the cause is then
+                // on the caller's transport writer.
+                w.err = w.conn.failure();
                 return err;
             };
         }

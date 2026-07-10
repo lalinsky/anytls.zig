@@ -11,6 +11,26 @@ const test_key_pem = @embedFile("testdata/key.pem");
 // limitation); tests asserting it are skipped there.
 const has_client_alpn = anytls.backend != .tls_zig;
 
+/// A transport reader whose every read fails, standing in for a cancelled or
+/// broken transport. The concrete cause (error.Canceled, ...) would live in
+/// this reader's own `err` field; anytls only ever sees error.ReadFailed.
+const FailingReader = struct {
+    interface: Io.Reader,
+
+    fn init(buffer: []u8) FailingReader {
+        return .{ .interface = .{
+            .vtable = &.{ .stream = stream },
+            .buffer = buffer,
+            .seek = 0,
+            .end = 0,
+        } };
+    }
+
+    fn stream(_: *Io.Reader, _: *Io.Writer, _: Io.Limit) Io.Reader.StreamError!usize {
+        return error.ReadFailed;
+    }
+};
+
 const TestServer = struct {
     /// Accepts one connection, completes the TLS handshake, then drops the
     /// TCP connection without sending close_notify.
@@ -289,4 +309,26 @@ test "large transfer with small buffers" {
     try testing.expectEqualSlices(u8, send_data, recv_data);
     try conn.close();
     try env.awaitServer();
+}
+
+test "handshake reports a transport read failure coarsely, not as a TLS error" {
+    // error.Canceled and other transport failures ride in the transport
+    // reader's own `err`, which anytls cannot see. Even during the handshake
+    // such a failure must surface as the coarse error.ReadFailed — so the
+    // caller can recover the real cause from the transport reader it owns —
+    // and must never be converted into a TLS-layer error.
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var in_buf: [anytls.input_buffer_len]u8 = undefined;
+    var out_buf: [anytls.output_buffer_len]u8 = undefined;
+    var reader = FailingReader.init(&in_buf);
+    var discarding = Io.Writer.Discarding.init(&out_buf);
+
+    try testing.expectError(error.ReadFailed, anytls.client(io, &reader.interface, &discarding.writer, .{
+        .host = "localhost",
+        .allocator = testing.allocator,
+        .root_ca = .none,
+    }));
 }

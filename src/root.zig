@@ -108,11 +108,13 @@ pub const Connection = struct {
     /// record, or `error.TlsConnectionTruncated` (transport ended without
     /// close_notify). A *transport* failure returns `error.ReadFailed`/
     /// `error.WriteFailed` but leaves this null; the underlying cause is on
-    /// the caller's transport reader/writer, so recover it the same way
-    /// `std.http` does over TLS:
+    /// the caller's transport reader or writer. TLS drives both directions
+    /// regardless of the call (a read may flush, a write may read a
+    /// post-handshake message), so recover by checking both:
     ///
     ///     conn.read(buf) catch |err| switch (err) {
-    ///         error.ReadFailed => conn.failure() orelse tcp_reader.err.?,
+    ///         error.ReadFailed => conn.failure() orelse
+    ///             tcp_reader.err orelse tcp_writer.err orelse err,
     ///         ...
     ///     };
     ///

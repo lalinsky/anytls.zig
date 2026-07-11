@@ -117,13 +117,16 @@ maps onto the same names, coarsely, with the precise OpenSSL string in
 `conn.errorMessage()`.
 
 A **transport** failure returns `error.ReadFailed`/`error.WriteFailed` but
-leaves `failure()` null — the underlying cause is on the transport
-reader/writer you passed in. Recover it by falling through:
+leaves `failure()` null — the underlying cause (`error.Canceled`, a socket
+error, ...) is on the transport reader/writer you passed in. Recover it by
+falling through to *both* endpoints: a TLS read can flush and a TLS write can
+read a post-handshake message, so either side may be the one that failed.
 
 ```zig
 const n = conn.read(&buf) catch |err| switch (err) {
     error.EndOfStream => break, // clean close_notify
-    error.ReadFailed => return conn.failure() orelse tcp_reader.err.?,
+    error.ReadFailed => return conn.failure() orelse
+        tcp_reader.err orelse tcp_writer.err orelse err,
 };
 ```
 

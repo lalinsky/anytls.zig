@@ -26,7 +26,7 @@ pub fn build(b: *std.Build) void {
         .openssl => {
             mod.link_libc = true;
             const translate_c = b.addTranslateC(.{
-                .root_source_file = b.path("src/c.h"),
+                .root_source_file = b.path("src/openssl/c.h"),
                 .target = target,
                 .optimize = optimize,
             });

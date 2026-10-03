@@ -5,20 +5,14 @@
 
 TLS client/server for Zig with a backend selected at build time:
 
-- `openssl` — system libssl (OpenSSL 3), driven sans-I/O over memory BIOs
-- `tls_zig` — pure Zig [ianic/tls.zig]
+- `openssl` — system libssl (OpenSSL 3), driven sans-I/O through a custom BIO
+- `tls_zig` — pure Zig [ianic/tls.zig] (not yet ported to the current API)
 
-Both backends sit behind the same API and do all transport I/O through a
-caller-provided [`std.Io.Reader`]/[`std.Io.Writer`] pair, so any `std.Io`
-implementation works, including green-thread schedulers like [zio] where a
-task may resume on a different OS thread.
+All transport I/O goes through a caller-provided [`std.Io.Reader`]/[`std.Io.Writer`]
+pair, so any `std.Io` implementation works, including green-thread schedulers
+like [zio] where a task may resume on a different OS thread.
 
 > Work in progress. Requires Zig 0.16.
-
-Things to do:
-
-- [ ] better error handling
-- [ ] better root CA bundle handling
 
 [ianic/tls.zig]: https://github.com/ianic/tls.zig
 [zio]: https://github.com/lalinsky/zio
@@ -39,7 +33,7 @@ zig fetch --save "git+https://github.com/lalinsky/anytls.zig"
 const anytls = b.dependency("anytls", .{
     .target = target,
     .optimize = optimize,
-    .backend = .openssl, // or .tls_zig
+    .backend = .openssl,
 });
 exe.root_module.addImport("anytls", anytls.module("anytls"));
 ```
@@ -49,87 +43,117 @@ headers need to be installed (`libssl-dev` on Debian/Ubuntu).
 
 ## Usage
 
-`anytls.client` upgrades an established connection to TLS. The transport
-buffers must be at least `anytls.input_buffer_len`/`anytls.output_buffer_len`
-bytes, enough for one full TLS record in each direction:
+A context holds the configuration: certificates, keys and the trust store. It
+is created once, is immutable afterwards, may be shared by any number of
+connections on any thread, and must outlive every connection created from it.
 
 ```zig
 const anytls = @import("anytls");
 
+var diag: anytls.ConfigDiagnostics = .{};
+var ctx = anytls.ClientContext.init(gpa, io, .{
+    .ca = .system, // or .{ .file = path }, .{ .dir = path }, .{ .pem = bytes }
+    .alpn = &.{ "h2", "http/1.1" },
+}, &diag) catch |err| {
+    std.log.err("TLS config: {t}: {s}", .{ err, diag.message() });
+    return err;
+};
+defer ctx.deinit();
+```
+
+A connection runs over an established transport. The transport buffers must
+be at least `anytls.input_buffer_len`/`anytls.output_buffer_len` bytes. The
+connection must not move after `initClient`/`initServer`:
+
+```zig
 var in_buf: [anytls.input_buffer_len]u8 = undefined;
 var out_buf: [anytls.output_buffer_len]u8 = undefined;
 var tcp_reader = tcp.reader(io, &in_buf);
 var tcp_writer = tcp.writer(io, &out_buf);
 
-var conn = try anytls.client(io, &tcp_reader.interface, &tcp_writer.interface, .{
-    .host = "example.com",
-    .allocator = allocator,
+var conn: anytls.Connection = undefined;
+try conn.initClient(&ctx, io, &tcp_reader.interface, &tcp_writer.interface, .{
+    .server_name = "example.com", // SNI and verification; an IP literal verifies the IP SAN
 });
 defer conn.deinit();
+try conn.handshake();
 
-try conn.writeAll("GET / HTTP/1.0\r\nHost: example.com\r\n\r\n");
+var rbuf: [16 * 1024]u8 = undefined;
+var wbuf: [16 * 1024]u8 = undefined;
+var reader = conn.reader(&rbuf); // std.Io.Reader for cleartext
+var writer = conn.writer(&wbuf); // std.Io.Writer for cleartext
 
-var buf: [4096]u8 = undefined;
-while (true) {
-    const n = conn.read(&buf) catch |err| switch (err) {
-        error.EndOfStream => break, // peer sent close_notify
-        else => |e| return e,
-    };
-    // use buf[0..n]
-}
-```
-
-The server side is the same, with a certificate instead of a host name:
-
-```zig
-var conn = try anytls.server(io, &tcp_reader.interface, &tcp_writer.interface, .{
-    .auth = .{ .cert_pem = cert_pem, .key_pem = key_pem },
-    .allocator = allocator,
-});
-```
-
-A connection can also be wrapped in `std.Io.Reader`/`std.Io.Writer`
-interfaces:
-
-```zig
-var rd_buf: [4096]u8 = undefined;
-var wr_buf: [4096]u8 = undefined;
-var reader = conn.reader(&rd_buf);
-var writer = conn.writer(&wr_buf);
-
-try writer.interface.print("hello {d}\n", .{42});
-try writer.interface.flush();
+try writer.interface.writeAll("GET / HTTP/1.0\r\nHost: example.com\r\n\r\n");
+try writer.interface.flush(); // encrypts and flushes the transport
 const line = try reader.interface.takeDelimiterInclusive('\n');
+
+try conn.close(); // close_notify; does not close the transport
 ```
+
+A server is the same with a `ServerContext`:
+
+```zig
+var ctx = try anytls.ServerContext.init(gpa, io, .{
+    .certificate = .{ .chain = .{ .file = "cert.pem" }, .key = .{ .file = "key.pem" } },
+    .client_auth = .{ .ca = .{ .file = "clients.pem" }, .mode = .require }, // optional mTLS
+}, &diag);
+
+var conn: anytls.Connection = undefined;
+try conn.initServer(&ctx, io, &tcp_reader.interface, &tcp_writer.interface);
+```
+
+### Concurrency
+
+One task may use the reader while another uses the writer, after the
+handshake. Two readers or two writers at once are not supported, and
+`close()` belongs to the writer side.
 
 ## Error handling
 
-`read` returns `error.ReadFailed`/`error.EndOfStream`; `writeAll`/`close`
-return `error.WriteFailed`. These are deliberately coarse — the actual cause
-lives in a diagnostic field, the same layered convention `std.http` uses over
-TLS.
+TLS failures are a small error set, `anytls.TlsError`; the details are in
+`conn.diagnostics()`:
 
-`conn.failure()` (an `?anyerror`, mirrored in `reader.err`/`writer.err`) holds
-the **TLS-layer** reason: a received alert, a bad record, or
-`error.TlsConnectionTruncated` when the transport ended without close_notify.
-The tls_zig backend reports its own `error.Tls*` verbatim; the openssl backend
-maps onto the same names, coarsely, with the precise OpenSSL string in
-`conn.errorMessage()`.
+| Error | Meaning | Details |
+|---|---|---|
+| `ConnectionTruncated` | transport ended inside a record, or during the handshake | |
+| `AlertReceived` | the peer aborted | `alert_received` (e.g. `.certificate_required`) |
+| `CertificateRejected` | we rejected the peer's certificate | `certificate.reason` (`.untrusted`, `.name_mismatch`, `.expired`, ...), `certificate.depth` |
+| `Incompatible` | no common version, cipher, group or ALPN protocol | |
+| `ProtocolViolation` | the peer broke the protocol | `not_tls` if it is not speaking TLS at all |
+| `Internal` | failure on our side | |
 
-A **transport** failure returns `error.ReadFailed`/`error.WriteFailed` but
-leaves `failure()` null — the underlying cause (`error.Canceled`, a socket
-error, ...) is on the transport reader/writer you passed in. Recover it by
-falling through to *both* endpoints: a TLS read can flush and a TLS write can
-read a post-handshake message, so either side may be the one that failed.
+`diagnostics().detail` has the backend's message for logs, and the
+`Diagnostics` value formats as a one-line summary with `{f}`.
+
+**Transport failures are never converted into TLS errors.** The reader
+returns `error.ReadFailed` with `reader.err` holding the TLS cause, or null
+when the transport reader failed, whose own `err` then has the cause
+(`error.Canceled`, `error.ConnectionResetByPeer`, ...). The writer works the
+same way with the transport writer. The reader never writes to the transport
+and the writer never reads from it, so the cause is always on the matching
+side:
 
 ```zig
-const n = conn.read(&buf) catch |err| switch (err) {
-    error.EndOfStream => break, // clean close_notify
-    error.ReadFailed => return conn.failure() orelse
-        tcp_reader.err orelse tcp_writer.err orelse err,
+const n = reader.interface.readSliceShort(&buf) catch |err| switch (err) {
+    error.EndOfStream => return, // close_notify, or EOF at a record boundary
+    error.ReadFailed => return reader.err orelse tcp_reader.err.?,
 };
 ```
 
-A transport that ends without close_notify is thus `error.ReadFailed` with
-`failure() == error.TlsConnectionTruncated`, distinct from a clean end of
-stream (`error.EndOfStream` returned directly from `read`, `failure()` null).
+`handshake()` returns the `TlsError` directly, or `error.ReadFailed`/
+`error.WriteFailed` for a transport failure:
+
+```zig
+conn.handshake() catch |err| switch (err) {
+    error.ReadFailed => return tcp_reader.err.?, // e.g. Canceled by a timeout
+    error.WriteFailed => return tcp_writer.err.?,
+    else => {
+        std.log.warn("TLS handshake failed: {t}: {f}", .{ err, conn.diagnostics().* });
+        return err;
+    },
+};
+```
+
+End of stream follows Go's `crypto/tls`. A close_notify, or a transport EOF
+at a record boundary, is `error.EndOfStream`; many servers close without
+close_notify. A transport EOF inside a record is `ConnectionTruncated`.

@@ -1,235 +1,59 @@
-//! anytls — TLS client/server over any `std.Io` transport.
+//! anytls — TLS for Zig over any `std.Io` transport, with the backend
+//! selected at build time (`-Dbackend`).
 //!
-//! The TLS implementation is selected at build time (`-Dbackend`):
-//! * `openssl` — system libssl (OpenSSL 3), driven sans-I/O over memory BIOs.
-//! * `tls_zig` — pure Zig ianic/tls.zig.
-//!
-//! Both backends do all transport I/O through the caller-provided
-//! `*Io.Reader`/`*Io.Writer`, so any `Io` implementation works, including
-//! green-thread schedulers without OS-thread affinity.
+//! * `ClientContext`/`ServerContext` hold configuration (certificates, keys,
+//!   trust store). They are built once, are immutable afterwards, may be
+//!   shared by any number of connections across threads, and must outlive
+//!   every connection created from them.
+//! * `Connection` is one TLS connection over a caller-provided transport
+//!   `*Io.Reader`/`*Io.Writer`. It must not move after init.
+//! * `Connection.reader`/`Connection.writer` give the cleartext
+//!   `std.Io.Reader`/`std.Io.Writer`. One task may read while another
+//!   writes.
 const std = @import("std");
-const Io = std.Io;
-const common = @import("common.zig");
 const build_options = @import("build_options");
+const api = @import("api.zig");
 
 pub const backend = build_options.backend;
-pub const Backend = @TypeOf(backend);
 
 const impl = switch (backend) {
-    .openssl => @import("openssl.zig"),
-    .tls_zig => @import("tlszig.zig"),
+    .openssl => struct {
+        const context = @import("openssl/context.zig");
+        const ClientContext = context.ClientContext;
+        const ServerContext = context.ServerContext;
+        const Connection = @import("openssl/Connection.zig");
+    },
+    .tls_zig => @compileError("the tls_zig backend has not been ported to the new API yet"),
 };
 
-pub const config = common.config;
-pub const InitError = common.InitError;
-pub const HandshakeError = common.HandshakeError;
-pub const ClientError = InitError || HandshakeError;
-pub const ServerError = InitError || HandshakeError;
+pub const ClientContext = impl.ClientContext;
+pub const ServerContext = impl.ServerContext;
+pub const Connection = impl.Connection;
 
-/// Required transport buffer sizes, identical on both backends: the reader
-/// buffer must hold one full TLS ciphertext record, the writer buffer one
-/// full encrypted record.
-pub const input_buffer_len = 16645;
-pub const output_buffer_len = 16469;
+/// Minimum transport reader buffer size: one full ciphertext record.
+pub const input_buffer_len = Connection.input_buffer_len;
+/// Minimum transport writer buffer size: one full record plus overhead.
+pub const output_buffer_len = Connection.output_buffer_len;
 
-/// Upgrades a transport reader/writer pair to a TLS connection by performing
-/// the client side of the handshake.
-///
-/// `io` supplies randomness and wall-clock time where the backend needs them
-/// (tls_zig); the openssl backend uses its own RNG and clock and ignores it.
-pub fn client(io: Io, input: *Io.Reader, output: *Io.Writer, opt: config.Client) ClientError!Connection {
-    std.debug.assert(input.buffer.len >= input_buffer_len);
-    std.debug.assert(output.buffer.len >= output_buffer_len);
-    try common.validate(opt.host, opt.alpn_protocols);
-    return .{ .impl = try impl.client(io, input, output, opt) };
-}
+pub const Source = api.Source;
+pub const CaSource = api.CaSource;
+pub const CertificateSource = api.CertificateSource;
+pub const Verify = api.Verify;
+pub const ClientOptions = api.ClientOptions;
+pub const ServerOptions = api.ServerOptions;
+pub const ClientAuth = api.ClientAuth;
+pub const ClientConnectionOptions = api.ClientConnectionOptions;
 
-/// Upgrades a transport reader/writer pair to a TLS connection by performing
-/// the server side of the handshake.
-///
-/// Note: the tls_zig backend serves TLS 1.3 only; openssl serves 1.2 and 1.3.
-pub fn server(io: Io, input: *Io.Reader, output: *Io.Writer, opt: config.Server) ServerError!Connection {
-    std.debug.assert(input.buffer.len >= input_buffer_len);
-    std.debug.assert(output.buffer.len >= output_buffer_len);
-    try common.validate("", opt.alpn_protocols);
-    return .{ .impl = try impl.server(io, input, output, opt) };
-}
-
-/// An established TLS connection. One connection must be driven by one task
-/// at a time; concurrent read and write from different tasks is not
-/// supported by either backend.
-pub const Connection = struct {
-    /// Backend connection; its type depends on `backend`. Backend-specific
-    /// functionality is available here behind `comptime` checks.
-    impl: impl.Connection,
-
-    /// Reads decrypted data into `buffer`. Returns the number of bytes read.
-    /// A return of 0 means no application data was available this call (for
-    /// example `buffer` was empty, or only post-handshake messages were
-    /// processed); it does *not* signal end of stream, and the caller may
-    /// read again.
-    ///
-    /// A clean shutdown (close_notify received) is reported as
-    /// `error.EndOfStream`; once seen, every subsequent read returns it too.
-    /// A transport end of stream without close_notify is reported as
-    /// `error.ReadFailed` with `failure() == error.TlsConnectionTruncated`.
-    pub fn read(conn: *Connection, buffer: []u8) error{ ReadFailed, EndOfStream }!usize {
-        return conn.impl.read(buffer);
-    }
-
-    /// Encrypts and sends `bytes`, flushing the transport.
-    pub fn writeAll(conn: *Connection, bytes: []const u8) error{WriteFailed}!void {
-        return conn.impl.writeAll(bytes);
-    }
-
-    /// Best-effort: sends close_notify and flushes the transport. Does not
-    /// wait for the peer's close_notify; whether one is sent after the peer
-    /// already closed is backend-dependent. After `close` the connection may
-    /// only be deinitialized. Does not close the underlying transport.
-    pub fn close(conn: *Connection) error{WriteFailed}!void {
-        return conn.impl.close();
-    }
-
-    /// Frees backend resources. Does not close the underlying transport.
-    pub fn deinit(conn: *Connection) void {
-        conn.impl.deinit();
-        conn.* = undefined;
-    }
-
-    /// ALPN protocol negotiated during the handshake, null if none.
-    /// Valid until `deinit`.
-    pub fn alpnProtocol(conn: *const Connection) ?[]const u8 {
-        return conn.impl.alpnProtocol();
-    }
-
-    /// The TLS-layer reason the most recent read/write/close failed, or null.
-    ///
-    /// Only genuine TLS errors are reported here — a received alert, a bad
-    /// record, or `error.TlsConnectionTruncated` (transport ended without
-    /// close_notify). A *transport* failure returns `error.ReadFailed`/
-    /// `error.WriteFailed` but leaves this null; the underlying cause is on
-    /// the caller's transport reader or writer. TLS drives both directions
-    /// regardless of the call (a read may flush, a write may read a
-    /// post-handshake message), so recover by checking both:
-    ///
-    ///     conn.read(buf) catch |err| switch (err) {
-    ///         error.ReadFailed => conn.failure() orelse
-    ///             tcp_reader.err orelse tcp_writer.err orelse err,
-    ///         ...
-    ///     };
-    ///
-    /// The tls_zig backend reports its own error verbatim; the openssl backend
-    /// maps onto the same names, coarsely (the precise OpenSSL cause stays in
-    /// `errorMessage`).
-    pub fn failure(conn: *const Connection) ?anyerror {
-        return conn.impl.err;
-    }
-
-    /// Best-effort human-readable detail for the most recent failure:
-    /// the OpenSSL error string, or the underlying tls.zig error name.
-    pub fn errorMessage(conn: *const Connection) []const u8 {
-        return conn.impl.errorMessage();
-    }
-
-    pub fn reader(conn: *Connection, buffer: []u8) Reader {
-        return .init(conn, buffer);
-    }
-
-    pub fn writer(conn: *Connection, buffer: []u8) Writer {
-        return .init(conn, buffer);
-    }
-
-    // The adapters sit directly on Connection.read/writeAll — never on a
-    // backend adapter — so there is exactly one cleartext-side Io.Reader/
-    // Io.Writer in the stack regardless of backend.
-
-    pub const Reader = struct {
-        conn: *Connection,
-        interface: Io.Reader,
-        /// TLS-layer cause after the interface returns error.ReadFailed; see
-        /// `Connection.failure`. Null for a transport-level failure (recover
-        /// it from the underlying transport reader instead).
-        err: ?anyerror = null,
-
-        pub fn init(conn: *Connection, buffer: []u8) Reader {
-            return .{
-                .conn = conn,
-                .interface = .{
-                    .vtable = &.{ .stream = Reader.stream },
-                    .buffer = buffer,
-                    .seek = 0,
-                    .end = 0,
-                },
-            };
-        }
-
-        fn stream(io_r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
-            const r: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
-            const dest = limit.slice(try w.writableSliceGreedy(1));
-            const n = r.conn.read(dest) catch |err| switch (err) {
-                error.EndOfStream => return error.EndOfStream,
-                error.ReadFailed => {
-                    // Null when the failure was transport-level; the cause is
-                    // then on the caller's transport reader.
-                    r.err = r.conn.failure();
-                    return error.ReadFailed;
-                },
-            };
-            w.advance(n);
-            return n;
-        }
-    };
-
-    pub const Writer = struct {
-        conn: *Connection,
-        interface: Io.Writer,
-        /// TLS-layer cause after the interface returns error.WriteFailed; see
-        /// `Connection.failure`. Null for a transport-level failure (recover
-        /// it from the underlying transport writer instead).
-        err: ?anyerror = null,
-
-        pub fn init(conn: *Connection, buffer: []u8) Writer {
-            return .{
-                .conn = conn,
-                .interface = .{
-                    .vtable = &.{ .drain = Writer.drain },
-                    .buffer = buffer,
-                },
-            };
-        }
-
-        fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
-            const w: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
-            var total: usize = 0;
-            const buffered = io_w.buffered();
-            if (buffered.len != 0) {
-                try w.writeAll(buffered);
-                total += buffered.len;
-            }
-            for (data[0 .. data.len - 1]) |slice| {
-                if (slice.len == 0) continue;
-                try w.writeAll(slice);
-                total += slice.len;
-            }
-            const pattern = data[data.len - 1];
-            if (pattern.len != 0) for (0..splat) |_| {
-                try w.writeAll(pattern);
-                total += pattern.len;
-            };
-            return io_w.consume(total);
-        }
-
-        fn writeAll(w: *Writer, bytes: []const u8) Io.Writer.Error!void {
-            w.conn.writeAll(bytes) catch |err| {
-                // Null when the failure was transport-level; the cause is then
-                // on the caller's transport writer.
-                w.err = w.conn.failure();
-                return err;
-            };
-        }
-    };
-};
+pub const ConfigError = api.ConfigError;
+pub const ConfigDiagnostics = api.ConfigDiagnostics;
+pub const ConnectionInitError = api.ConnectionInitError;
+pub const TlsError = api.TlsError;
+pub const HandshakeError = api.HandshakeError;
+pub const Diagnostics = api.Diagnostics;
+pub const Alert = api.Alert;
+pub const CertificateProblem = api.CertificateProblem;
 
 test {
+    _ = @import("record.zig");
     _ = @import("test.zig");
 }

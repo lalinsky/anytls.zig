@@ -1,14 +1,12 @@
 //! `std.Io.Reader`/`std.Io.Writer` adapters over a backend connection.
 //!
 //! A backend connection provides:
-//! * `read(conn, dest) error{ ReadFailed, EndOfStream }!usize` — decrypts at
-//!   least one byte into `dest` (which is non-empty), or fails;
-//! * `write(conn, bytes) error{WriteFailed}!void` — encrypts all of `bytes`
-//!   into the transport writer without flushing it;
-//! * `flush(conn) error{WriteFailed}!void` — sends anything queued and
-//!   flushes the transport writer;
-//! * `failure(conn) ?TlsError` — the TLS-layer cause of the last failure,
-//!   null if it was the transport.
+//! * `read(conn, dest) (StreamError || error{EndOfStream})!usize` —
+//!   decrypts at least one byte into `dest` (which is non-empty);
+//! * `write(conn, bytes) StreamError!void` — encrypts all of `bytes` into
+//!   the transport writer without necessarily flushing it;
+//! * `flush(conn) StreamError!void` — sends anything queued and flushes the
+//!   transport writer.
 const std = @import("std");
 const Io = std.Io;
 const api = @import("api.zig");
@@ -17,10 +15,10 @@ pub fn Reader(comptime Connection: type) type {
     return struct {
         conn: *Connection,
         interface: Io.Reader,
-        /// TLS-layer cause after the interface returned `error.ReadFailed`.
-        /// Null means the transport reader failed; its own `err` has the
-        /// cause.
-        err: ?api.TlsError = null,
+        /// Why the interface returned `error.ReadFailed`; see
+        /// `StreamError`. `TransportReadFailed`/`TransportWriteFailed` mean
+        /// the cause is in the transport reader's/writer's own `err`.
+        err: ?api.StreamError = null,
 
         const Self = @This();
 
@@ -42,8 +40,8 @@ pub fn Reader(comptime Connection: type) type {
             if (dest.len == 0) return 0;
             const n = r.conn.read(dest) catch |err| switch (err) {
                 error.EndOfStream => return error.EndOfStream,
-                error.ReadFailed => {
-                    r.err = r.conn.failure();
+                else => |e| {
+                    r.err = e;
                     return error.ReadFailed;
                 },
             };
@@ -57,10 +55,10 @@ pub fn Writer(comptime Connection: type) type {
     return struct {
         conn: *Connection,
         interface: Io.Writer,
-        /// TLS-layer cause after the interface returned `error.WriteFailed`.
-        /// Null means the transport writer failed; its own `err` has the
-        /// cause.
-        err: ?api.TlsError = null,
+        /// Why the interface returned `error.WriteFailed`; see
+        /// `StreamError`. `TransportReadFailed`/`TransportWriteFailed` mean
+        /// the cause is in the transport reader's/writer's own `err`.
+        err: ?api.StreamError = null,
 
         const Self = @This();
 
@@ -84,11 +82,8 @@ pub fn Writer(comptime Connection: type) type {
                 total += bytes.len;
             }
             const pattern = data[data.len - 1];
-            for (0..splat) |_| {
-                try w.write(pattern);
-                total += pattern.len;
-            }
-            return total;
+            try w.writeSplat(pattern, splat);
+            return total + pattern.len * splat;
         }
 
         fn flush(io_w: *Io.Writer) Io.Writer.Error!void {
@@ -96,16 +91,35 @@ pub fn Writer(comptime Connection: type) type {
             try w.write(io_w.buffered());
             io_w.end = 0;
             w.conn.flush() catch |err| {
-                w.err = w.conn.failure();
-                return err;
+                w.err = err;
+                return error.WriteFailed;
             };
+        }
+
+        /// Repeats a short pattern into blocks, so a splat (e.g. padding)
+        /// becomes a few records instead of one record per repetition.
+        fn writeSplat(w: *Self, pattern: []const u8, splat: usize) Io.Writer.Error!void {
+            if (pattern.len == 0 or splat == 0) return;
+            var block: [4096]u8 = undefined;
+            if (splat == 1 or pattern.len > block.len / 2) {
+                for (0..splat) |_| try w.write(pattern);
+                return;
+            }
+            const per_block = block.len / pattern.len;
+            for (0..per_block) |i| @memcpy(block[i * pattern.len ..][0..pattern.len], pattern);
+            var left = splat;
+            while (left > 0) {
+                const k = @min(per_block, left);
+                try w.write(block[0 .. k * pattern.len]);
+                left -= k;
+            }
         }
 
         fn write(w: *Self, bytes: []const u8) Io.Writer.Error!void {
             if (bytes.len == 0) return;
             w.conn.write(bytes) catch |err| {
-                w.err = w.conn.failure();
-                return err;
+                w.err = err;
+                return error.WriteFailed;
             };
         }
     };

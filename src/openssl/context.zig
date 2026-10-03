@@ -15,6 +15,7 @@ const ConfigDiagnostics = api.ConfigDiagnostics;
 pub const Shared = struct {
     gpa: Allocator,
     ssl_ctx: *c.SSL_CTX,
+    /// Process-wide; not owned.
     bio_method: *c.BIO_METHOD,
     /// Server ALPN preference list in wire format; the select callback's arg.
     alpn_select: ?*AlpnSelect = null,
@@ -28,8 +29,7 @@ pub const Shared = struct {
     fn init(gpa: Allocator, method: ?*const c.SSL_METHOD) ConfigError!Shared {
         const ssl_ctx = c.SSL_CTX_new(method) orelse return error.OutOfMemory;
         errdefer c.SSL_CTX_free(ssl_ctx);
-        const bio_method = try Connection.newBioMethod();
-        errdefer c.BIO_meth_free(bio_method);
+        const bio_method = try Connection.bioMethod();
 
         if (c.SSL_CTX_set_min_proto_version(ssl_ctx, c.TLS1_2_VERSION) != 1) return error.Unsupported;
         _ = c.SSL_CTX_set_mode(ssl_ctx, c.SSL_MODE_ENABLE_PARTIAL_WRITE | c.SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
@@ -47,7 +47,6 @@ pub const Shared = struct {
             if (live != 0) std.log.scoped(.anytls).err("context deinitialized with {d} live connection(s)", .{live});
         }
         c.SSL_CTX_free(s.ssl_ctx);
-        c.BIO_meth_free(s.bio_method);
         if (s.alpn_select) |a| s.gpa.destroy(a);
         s.* = undefined;
     }
@@ -118,8 +117,8 @@ pub const ServerContext = struct {
 
         if (opt.alpn.len > 0) {
             const a = try gpa.create(AlpnSelect);
+            shared.alpn_select = a; // freed by shared.deinit on error
             a.len = (try api.alpnWireFormat(&a.buf, opt.alpn)).len;
-            shared.alpn_select = a;
             c.SSL_CTX_set_alpn_select_cb(ctx, alpnSelect, a);
         }
         return .{ .shared = shared };

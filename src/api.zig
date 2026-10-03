@@ -111,8 +111,7 @@ pub const ConnectionInitError = error{
 };
 
 /// TLS-layer failures. Transport failures are never reported as one of
-/// these; they surface as `error.ReadFailed`/`error.WriteFailed` with the
-/// cause on the transport reader/writer.
+/// these; see `StreamError`.
 pub const TlsError = error{
     /// The transport ended in the middle of a record, or during the
     /// handshake.
@@ -133,7 +132,25 @@ pub const TlsError = error{
     Internal,
 };
 
-pub const HandshakeError = TlsError || error{ ReadFailed, WriteFailed };
+/// Why a handshake, read, write or close failed.
+///
+/// Either side of a connection can touch either side of the transport:
+/// a read may have to send a reply the peer asked for (a KeyUpdate, or the
+/// alert reporting a failure), and a write may have to receive the rest of
+/// a post-handshake message before libssl lets it continue. So a failure is
+/// reported by naming which transport endpoint failed, not by which TLS
+/// operation was running:
+///
+/// * `TransportReadFailed` — the transport *reader* failed; its own `err`
+///   field has the cause (`error.Canceled`, `error.ConnectionResetByPeer`,
+///   ...).
+/// * `TransportWriteFailed` — the transport *writer* failed; its own `err`
+///   field has the cause. Once this happens the connection can no longer
+///   send, and every later write, flush or close returns it again.
+/// * anything else — a TLS-layer failure, with details in
+///   `Connection.diagnostics()`. TLS failures are sticky: every later
+///   operation returns the same error.
+pub const StreamError = TlsError || error{ TransportReadFailed, TransportWriteFailed };
 
 /// TLS alert descriptions (RFC 8446 section 6, plus older ones).
 pub const Alert = enum(u8) {

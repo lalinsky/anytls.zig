@@ -108,12 +108,59 @@ One task may use the reader while another uses the writer, after the
 handshake. Two readers or two writers at once are not supported, and
 `close()` belongs to the writer side.
 
+The two sides are not independent, because TLS isn't: a read may have to
+send something (the reply to a peer's KeyUpdate request, or the alert
+reporting a failure), and then waits for an in-progress write to finish
+first. A write may need the rest of a post-handshake message from the peer
+before libssl lets it continue, and then waits for an in-progress read, or
+reads from the transport itself if there is none.
+
 ## Error handling
 
-TLS failures are a small error set, `anytls.TlsError`; the details are in
-`conn.diagnostics()`:
+Every operation (`handshake`, `read`, `write`, `flush`, `close`) fails with
+`anytls.StreamError`, which says *where* the failure is:
 
-| Error | Meaning | Details |
+| Error | Where to look |
+|---|---|
+| `TransportReadFailed` | the transport **reader** failed; its own `err` has the cause (`error.Canceled`, `error.ConnectionResetByPeer`, ...) |
+| `TransportWriteFailed` | the transport **writer** failed; its own `err` has the cause. Sticky: the connection can no longer send |
+| any `TlsError` | a TLS failure; details in `conn.diagnostics()`. Sticky: every later operation returns it again |
+
+Because of the coupling described above, **either transport error can come
+out of any operation**: a read can fail with `TransportWriteFailed` (it was
+sending a KeyUpdate reply), and a write can fail with `TransportReadFailed`.
+Always look at the transport side the error names, not the side of the
+operation that failed.
+
+Through the `std.Io` interfaces, the reader returns `error.ReadFailed` and
+the writer `error.WriteFailed`, and their `err` field holds the
+`StreamError`. A clean end of stream is `error.EndOfStream` from the reader
+and is never an error in `err`.
+
+```zig
+fn cause(err: anytls.StreamError, tcp_reader: *Io.net.Stream.Reader, tcp_writer: *Io.net.Stream.Writer) anyerror {
+    return switch (err) {
+        error.TransportReadFailed => tcp_reader.err.?,
+        error.TransportWriteFailed => tcp_writer.err.?,
+        else => err, // TLS failure; see conn.diagnostics()
+    };
+}
+
+const line = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
+    error.EndOfStream => return, // close_notify, or EOF at a record boundary
+    error.ReadFailed => return cause(reader.err.?, &tcp_reader, &tcp_writer),
+    else => |e| return e,
+};
+
+conn.handshake() catch |err| {
+    std.log.warn("TLS handshake failed: {t}: {f}", .{ err, conn.diagnostics().* });
+    return cause(err, &tcp_reader, &tcp_writer);
+};
+```
+
+The TLS failures are a small set; `conn.diagnostics()` has the details:
+
+| `TlsError` | Meaning | Details |
 |---|---|---|
 | `ConnectionTruncated` | transport ended inside a record, or during the handshake | |
 | `AlertReceived` | the peer aborted | `alert_received` (e.g. `.certificate_required`) |
@@ -124,35 +171,6 @@ TLS failures are a small error set, `anytls.TlsError`; the details are in
 
 `diagnostics().detail` has the backend's message for logs, and the
 `Diagnostics` value formats as a one-line summary with `{f}`.
-
-**Transport failures are never converted into TLS errors.** The reader
-returns `error.ReadFailed` with `reader.err` holding the TLS cause, or null
-when the transport reader failed, whose own `err` then has the cause
-(`error.Canceled`, `error.ConnectionResetByPeer`, ...). The writer works the
-same way with the transport writer. The reader never writes to the transport
-and the writer never reads from it, so the cause is always on the matching
-side:
-
-```zig
-const n = reader.interface.readSliceShort(&buf) catch |err| switch (err) {
-    error.EndOfStream => return, // close_notify, or EOF at a record boundary
-    error.ReadFailed => return reader.err orelse tcp_reader.err.?,
-};
-```
-
-`handshake()` returns the `TlsError` directly, or `error.ReadFailed`/
-`error.WriteFailed` for a transport failure:
-
-```zig
-conn.handshake() catch |err| switch (err) {
-    error.ReadFailed => return tcp_reader.err.?, // e.g. Canceled by a timeout
-    error.WriteFailed => return tcp_writer.err.?,
-    else => {
-        std.log.warn("TLS handshake failed: {t}: {f}", .{ err, conn.diagnostics().* });
-        return err;
-    },
-};
-```
 
 End of stream follows Go's `crypto/tls`. A close_notify, or a transport EOF
 at a record boundary, is `error.EndOfStream`; many servers close without

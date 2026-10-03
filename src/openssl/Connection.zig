@@ -4,6 +4,15 @@
 //!
 //! Must not move after `initClient`/`initServer`: libssl holds pointers to
 //! it (app data, BIO data).
+//!
+//! Concurrency: after the handshake, one task may read while another
+//! writes. Three locks, always taken in this order:
+//! 1. `read_mutex` — held for a whole read, transport I/O included. The
+//!    writer only ever `tryLock`s it.
+//! 2. `write_mutex` — held for a whole write/flush/close, transport I/O
+//!    included. A reader takes it to send output its read produced.
+//! 3. `ssl_mutex` — held around each libssl call and the state it touches;
+//!    never across transport I/O.
 const Connection = @This();
 
 const std = @import("std");
@@ -16,6 +25,7 @@ const stream = @import("../stream.zig");
 const context = @import("context.zig");
 
 const TlsError = api.TlsError;
+const StreamError = api.StreamError;
 
 shared: *context.Shared,
 io: Io,
@@ -23,15 +33,23 @@ ssl: *c.SSL,
 input: *Io.Reader,
 output: *Io.Writer,
 
-/// Serializes libssl calls between the reader and the writer task. Never
-/// held across transport I/O.
-mutex: Io.Mutex = .init,
+read_mutex: Io.Mutex = .init,
+write_mutex: Io.Mutex = .init,
+ssl_mutex: Io.Mutex = .init,
+/// Bumped (under `ssl_mutex`) after every libssl read and when a read ends;
+/// a writer waiting for the reader to receive input waits for it to change.
+read_progress: u64 = 0,
+read_progress_cond: Io.Condition = .init,
+
 handshake_done: bool = false,
 /// close_notify received, or EOF at a record boundary.
 read_closed: bool = false,
 close_sent: bool = false,
 /// Sticky TLS-layer failure.
 failed: ?TlsError = null,
+/// The transport writer failed; nothing more can be sent. Guarded by
+/// `write_mutex`.
+write_failed: bool = false,
 
 /// Record boundaries of the ciphertext consumed so far.
 tracker: record.Tracker = .{},
@@ -42,8 +60,9 @@ bio_in_used: usize = 0,
 bio_out: []u8 = &.{},
 bio_out_used: usize = 0,
 
-/// Output produced while reading (KeyUpdate replies, alerts). The reader
-/// never touches the transport writer; the writer side sends this first.
+/// Output libssl produced during a read (KeyUpdate replies, alerts). The
+/// reader moves it into the transport writer under `write_mutex`; if it
+/// fills up, libssl reports WANT_WRITE and the reader sends it first.
 pending: [pending_capacity]u8 = undefined,
 pending_len: usize = 0,
 
@@ -121,15 +140,15 @@ fn init(conn: *Connection, shared: *context.Shared, io: Io, input: *Io.Reader, o
 
     const ssl = c.SSL_new(shared.ssl_ctx) orelse return error.OutOfMemory;
     errdefer c.SSL_free(ssl);
+    if (c.SSL_set_ex_data(ssl, 0, conn) != 1) return error.OutOfMemory;
     const rbio = c.BIO_new(shared.bio_method) orelse return error.OutOfMemory;
     const wbio = c.BIO_new(shared.bio_method) orelse {
         _ = c.BIO_free(rbio);
         return error.OutOfMemory;
     };
-    c.SSL_set_bio(ssl, rbio, wbio); // ssl owns both BIOs now
     c.BIO_set_data(rbio, conn);
     c.BIO_set_data(wbio, conn);
-    _ = c.SSL_set_ex_data(ssl, 0, conn);
+    c.SSL_set_bio(ssl, rbio, wbio); // ssl owns both BIOs now
 
     conn.* = .{
         .shared = shared,
@@ -149,14 +168,11 @@ pub fn deinit(conn: *Connection) void {
 }
 
 /// Performs the handshake. Must complete before the reader or writer is
-/// used, and runs on one task.
-///
-/// `error.ReadFailed`/`error.WriteFailed` mean the transport failed; the
-/// cause is on the transport reader/writer. Anything else is a TLS failure
-/// with details in `diagnostics()`.
-pub fn handshake(conn: *Connection) api.HandshakeError!void {
+/// used, and runs on one task. See `StreamError` for the errors.
+pub fn handshake(conn: *Connection) StreamError!void {
     assert(!conn.handshake_done);
     if (conn.failed) |err| return err;
+    if (conn.write_failed) return error.TransportWriteFailed;
     while (true) {
         const r = conn.call(conn.input.buffered(), conn.output.unusedCapacitySlice(), .handshake, &.{});
         conn.input.toss(r.consumed);
@@ -164,78 +180,95 @@ pub fn handshake(conn: *Connection) api.HandshakeError!void {
         switch (r.code) {
             c.SSL_ERROR_NONE => {
                 conn.handshake_done = true;
-                try conn.output.flush();
-                return;
+                return conn.flushTransport();
             },
             c.SSL_ERROR_WANT_READ => {
-                try conn.output.flush();
+                try conn.flushTransport();
                 conn.input.fillMore() catch |err| switch (err) {
-                    error.EndOfStream => return conn.fail(error.ConnectionTruncated),
-                    error.ReadFailed => return error.ReadFailed,
+                    error.EndOfStream => return conn.setFailed(error.ConnectionTruncated, "connection closed during handshake"),
+                    error.ReadFailed => return error.TransportReadFailed,
                 };
             },
-            c.SSL_ERROR_WANT_WRITE => try conn.output.flush(),
+            c.SSL_ERROR_WANT_WRITE => try conn.flushTransport(),
+            c.SSL_ERROR_ZERO_RETURN => return conn.setFailed(error.ConnectionTruncated, "close_notify during handshake"),
             else => {
-                conn.classifyFailure();
+                const err = conn.classifyFailure(r.code);
                 // Best effort: deliver the alert libssl wrote.
-                conn.output.flush() catch {};
-                return conn.failed.?;
+                conn.flushTransport() catch {};
+                return err;
             },
         }
     }
 }
 
-/// Decrypts into `dest` (non-empty). See `stream.zig` for the contract.
-pub fn read(conn: *Connection, dest: []u8) error{ ReadFailed, EndOfStream }!usize {
+/// Decrypts into `dest` (non-empty). Returns at least one byte, or
+/// `error.EndOfStream` after close_notify or a transport EOF at a record
+/// boundary.
+pub fn read(conn: *Connection, dest: []u8) (StreamError || error{EndOfStream})!usize {
     assert(conn.handshake_done);
+    assert(dest.len > 0);
+    conn.read_mutex.lockUncancelable(conn.io);
+    defer {
+        conn.ssl_mutex.lockUncancelable(conn.io);
+        conn.bumpReadProgress();
+        conn.ssl_mutex.unlock(conn.io);
+        conn.read_mutex.unlock(conn.io);
+    }
+
     while (true) {
-        conn.mutex.lockUncancelable(conn.io);
-        if (conn.failed != null) {
-            conn.mutex.unlock(conn.io);
-            return error.ReadFailed;
+        conn.ssl_mutex.lockUncancelable(conn.io);
+        if (conn.failed) |err| {
+            conn.ssl_mutex.unlock(conn.io);
+            return err;
         }
         if (conn.read_closed) {
-            conn.mutex.unlock(conn.io);
+            conn.ssl_mutex.unlock(conn.io);
             return error.EndOfStream;
         }
-        var n: usize = 0;
         const r = conn.call(conn.input.buffered(), conn.pending[conn.pending_len..], .read, dest);
         conn.input.toss(r.consumed);
         conn.pending_len += r.produced;
+        var n: usize = 0;
         switch (r.code) {
             c.SSL_ERROR_NONE => n = r.bytes,
             c.SSL_ERROR_ZERO_RETURN => conn.read_closed = true,
-            c.SSL_ERROR_WANT_READ => {},
-            c.SSL_ERROR_WANT_WRITE => {
-                // The pending queue is full: the peer keeps provoking
-                // replies (e.g. KeyUpdate requests) faster than we write.
-                conn.setDetail("too much post-handshake output pending");
-                conn.failed = error.ProtocolViolation;
-            },
-            else => conn.classifyFailure(),
+            c.SSL_ERROR_WANT_READ, c.SSL_ERROR_WANT_WRITE => {},
+            else => conn.failed = conn.classifyFailure(r.code),
         }
-        const failed = conn.failed != null;
+        conn.bumpReadProgress();
+        const failed = conn.failed;
         const closed = conn.read_closed;
-        conn.mutex.unlock(conn.io);
+        const has_pending = conn.pending_len > 0;
+        conn.ssl_mutex.unlock(conn.io);
 
+        // Send what the read produced before going on, as Go does: a
+        // KeyUpdate reply, or the alert reporting a failure.
+        if (has_pending) {
+            conn.sendPending() catch |err| {
+                // The TLS failure, if any, is the more useful cause.
+                if (failed) |tls_err| return tls_err;
+                return err;
+            };
+        }
         if (n > 0) return n;
-        if (failed) return error.ReadFailed;
+        if (failed) |err| return err;
         if (closed) return error.EndOfStream;
+        // The pending queue was full; it has been sent, try again.
+        if (r.code == c.SSL_ERROR_WANT_WRITE) continue;
 
         // libssl consumed everything buffered and wants more.
         conn.input.fillMore() catch |err| switch (err) {
-            error.ReadFailed => return error.ReadFailed,
+            error.ReadFailed => return error.TransportReadFailed,
             error.EndOfStream => {
-                conn.mutex.lockUncancelable(conn.io);
-                defer conn.mutex.unlock(conn.io);
+                conn.ssl_mutex.lockUncancelable(conn.io);
+                defer conn.ssl_mutex.unlock(conn.io);
                 // Go's rule: EOF at a record boundary ends the stream,
                 // inside a record it is truncation.
                 if (conn.tracker.atBoundary()) {
                     conn.read_closed = true;
                     return error.EndOfStream;
                 }
-                conn.failed = error.ConnectionTruncated;
-                return error.ReadFailed;
+                return conn.setFailed(error.ConnectionTruncated, "connection closed inside a record");
             },
         };
     }
@@ -243,71 +276,141 @@ pub fn read(conn: *Connection, dest: []u8) error{ ReadFailed, EndOfStream }!usiz
 
 /// Encrypts all of `bytes` into the transport writer, flushing the
 /// transport only when its buffer is full.
-pub fn write(conn: *Connection, bytes: []const u8) error{WriteFailed}!void {
+pub fn write(conn: *Connection, bytes: []const u8) StreamError!void {
     assert(conn.handshake_done);
+    conn.write_mutex.lockUncancelable(conn.io);
+    defer conn.write_mutex.unlock(conn.io);
+    assert(!conn.close_sent); // writing after close() is a usage error
+    if (conn.write_failed) return error.TransportWriteFailed;
+
     var off: usize = 0;
     while (off < bytes.len) {
         const chunk = bytes[off..][0..@min(bytes.len - off, max_fragment)];
-        conn.mutex.lockUncancelable(conn.io);
-        if (conn.failed != null) {
-            conn.mutex.unlock(conn.io);
-            return error.WriteFailed;
-        }
-        if (!conn.movePendingLocked() or conn.output.unusedCapacityLen() < chunk.len + max_record_overhead) {
-            conn.mutex.unlock(conn.io);
-            try conn.output.flush();
-            continue;
-        }
-        const r = conn.call(&.{}, conn.output.unusedCapacitySlice(), .write, @constCast(chunk));
-        conn.output.advance(r.produced);
-        switch (r.code) {
-            c.SSL_ERROR_NONE => off += r.bytes,
-            // Not expected with the space reserved above; retry after
-            // making room.
-            c.SSL_ERROR_WANT_WRITE => {},
-            else => conn.classifyFailure(),
-        }
-        const failed = conn.failed != null;
-        conn.mutex.unlock(conn.io);
-        if (failed) return error.WriteFailed;
-        if (r.code == c.SSL_ERROR_WANT_WRITE) try conn.output.flush();
+        off += try conn.writeOp(.write, @constCast(chunk));
     }
 }
 
-/// Sends output queued by the reader and flushes the transport writer.
-pub fn flush(conn: *Connection) error{WriteFailed}!void {
-    while (true) {
-        conn.mutex.lockUncancelable(conn.io);
-        const moved = conn.movePendingLocked();
-        conn.mutex.unlock(conn.io);
-        try conn.output.flush();
-        if (moved) return;
-    }
+/// Sends anything queued and flushes the transport writer.
+pub fn flush(conn: *Connection) StreamError!void {
+    conn.write_mutex.lockUncancelable(conn.io);
+    defer conn.write_mutex.unlock(conn.io);
+    if (conn.write_failed) return error.TransportWriteFailed;
+    try conn.movePendingAndFlush();
 }
 
-/// Sends close_notify (or a pending fatal alert) and flushes the transport.
-/// Idempotent. Belongs to the writer side. Does not wait for the peer's
-/// close_notify and does not close the transport.
-pub fn close(conn: *Connection) error{WriteFailed}!void {
-    while (true) {
-        conn.mutex.lockUncancelable(conn.io);
-        if (!conn.movePendingLocked() or conn.output.unusedCapacityLen() < max_record_overhead) {
-            conn.mutex.unlock(conn.io);
-            try conn.output.flush();
-            continue;
-        }
-        if (conn.handshake_done and conn.failed == null and !conn.close_sent) {
+/// Sends close_notify and flushes the transport. Idempotent; after it the
+/// connection may only read or be deinitialized. Does not wait for the
+/// peer's close_notify and does not close the transport. After a TLS
+/// failure it only flushes what is queued (the alert).
+pub fn close(conn: *Connection) StreamError!void {
+    conn.write_mutex.lockUncancelable(conn.io);
+    defer conn.write_mutex.unlock(conn.io);
+    if (conn.write_failed) return error.TransportWriteFailed;
+    if (conn.handshake_done and !conn.close_sent) {
+        conn.ssl_mutex.lockUncancelable(conn.io);
+        const ok = conn.failed == null;
+        conn.ssl_mutex.unlock(conn.io);
+        if (ok) {
+            _ = try conn.writeOp(.shutdown, &.{});
             conn.close_sent = true;
-            const r = conn.call(&.{}, conn.output.unusedCapacitySlice(), .shutdown, &.{});
-            conn.output.advance(r.produced);
         }
-        conn.mutex.unlock(conn.io);
-        return conn.output.flush();
+    }
+    try conn.movePendingAndFlush();
+}
+
+/// Runs SSL_write or SSL_shutdown until it succeeds, returning the number
+/// of cleartext bytes written. Caller holds `write_mutex`.
+fn writeOp(conn: *Connection, op: Op, buf: []u8) StreamError!usize {
+    // Set when libssl needs input to continue (a post-handshake message
+    // arrived only partly) and no read is in progress: the writer then feeds
+    // it input itself.
+    var holds_read = false;
+    defer if (holds_read) conn.read_mutex.unlock(conn.io);
+
+    while (true) {
+        conn.ssl_mutex.lockUncancelable(conn.io);
+        if (conn.failed) |err| {
+            conn.ssl_mutex.unlock(conn.io);
+            return err;
+        }
+        if (!conn.movePendingLocked() or conn.output.unusedCapacityLen() < buf.len + max_record_overhead) {
+            conn.ssl_mutex.unlock(conn.io);
+            try conn.flushTransport();
+            continue;
+        }
+        const in: []const u8 = if (holds_read) conn.input.buffered() else &.{};
+        // SSL_shutdown fails outright (instead of asking for input) while a
+        // post-handshake message is half received; finish that message
+        // first, which waits for input like a write does.
+        const this_op: Op = if (op == .shutdown and c.SSL_in_init(conn.ssl) != 0) .handshake else op;
+        const r = conn.call(in, conn.output.unusedCapacitySlice(), this_op, buf);
+        if (holds_read) conn.input.toss(r.consumed);
+        conn.output.advance(r.produced);
+        const err: ?TlsError = switch (r.code) {
+            c.SSL_ERROR_NONE, c.SSL_ERROR_WANT_READ, c.SSL_ERROR_WANT_WRITE => null,
+            else => conn.classifyFailure(r.code),
+        };
+        const progress = conn.read_progress;
+        conn.ssl_mutex.unlock(conn.io);
+
+        if (err) |e| return e;
+        switch (r.code) {
+            c.SSL_ERROR_NONE => if (this_op == op) return r.bytes,
+            c.SSL_ERROR_WANT_WRITE => try conn.flushTransport(),
+            c.SSL_ERROR_WANT_READ => {
+                if (holds_read) {
+                    try conn.flushTransport();
+                    conn.input.fillMore() catch |e| switch (e) {
+                        error.ReadFailed => return error.TransportReadFailed,
+                        error.EndOfStream => {
+                            conn.ssl_mutex.lockUncancelable(conn.io);
+                            defer conn.ssl_mutex.unlock(conn.io);
+                            return conn.setFailed(error.ConnectionTruncated, "connection closed inside a message");
+                        },
+                    };
+                } else if (conn.read_mutex.tryLock()) {
+                    holds_read = true;
+                } else {
+                    // A read is in progress and will feed libssl. Wait for
+                    // it without holding `write_mutex`, which the reader may
+                    // need to send what its read produced.
+                    conn.write_mutex.unlock(conn.io);
+                    conn.ssl_mutex.lockUncancelable(conn.io);
+                    while (conn.read_progress == progress and conn.failed == null)
+                        conn.read_progress_cond.waitUncancelable(conn.io, &conn.ssl_mutex);
+                    conn.ssl_mutex.unlock(conn.io);
+                    conn.write_mutex.lockUncancelable(conn.io);
+                    if (conn.write_failed) return error.TransportWriteFailed;
+                }
+            },
+            else => unreachable,
+        }
+    }
+}
+
+/// Reader side: sends output produced by a read. Takes `write_mutex`.
+fn sendPending(conn: *Connection) StreamError!void {
+    conn.write_mutex.lockUncancelable(conn.io);
+    defer conn.write_mutex.unlock(conn.io);
+    if (conn.write_failed) return error.TransportWriteFailed;
+    try conn.movePendingAndFlush();
+}
+
+/// Moves the pending queue into the transport writer and flushes it.
+/// Caller holds `write_mutex`.
+fn movePendingAndFlush(conn: *Connection) StreamError!void {
+    while (true) {
+        conn.ssl_mutex.lockUncancelable(conn.io);
+        const moved = conn.movePendingLocked();
+        conn.ssl_mutex.unlock(conn.io);
+        try conn.flushTransport();
+        if (moved) return;
     }
 }
 
 /// Moves the pending queue into the transport writer's buffer. Returns false
 /// if it does not fit; the caller must flush the transport and retry.
+/// Caller holds `write_mutex` and `ssl_mutex`.
 fn movePendingLocked(conn: *Connection) bool {
     if (conn.pending_len == 0) return true;
     const dest = conn.output.unusedCapacitySlice();
@@ -318,11 +421,27 @@ fn movePendingLocked(conn: *Connection) bool {
     return true;
 }
 
-/// The TLS-layer cause of the last failure; null if it was the transport.
+/// Flushes the transport writer; a failure is sticky. Caller holds
+/// `write_mutex` (or is the handshake).
+fn flushTransport(conn: *Connection) error{TransportWriteFailed}!void {
+    conn.output.flush() catch {
+        conn.write_failed = true;
+        return error.TransportWriteFailed;
+    };
+}
+
+fn bumpReadProgress(conn: *Connection) void {
+    conn.read_progress +%= 1;
+    conn.read_progress_cond.broadcast(conn.io);
+}
+
+/// The sticky TLS-layer failure, if any.
 pub fn failure(conn: *const Connection) ?TlsError {
     return conn.failed;
 }
 
+/// Details of the TLS failure. Valid until `deinit`; read it after an
+/// operation has failed.
 pub fn diagnostics(conn: *const Connection) *const api.Diagnostics {
     return &conn.diag;
 }
@@ -372,9 +491,9 @@ const CallResult = struct {
 };
 
 /// Runs one libssl operation against the given ciphertext windows. The
-/// error queue is thread-local, so it is cleared before and inspected right
-/// after the call, with no suspension point in between; `classifyFailure`
-/// must be called before the next suspension if the call failed.
+/// error queue is thread-local, so it is cleared before the call; if the
+/// call failed, `classifyFailure` must run before the next suspension
+/// point.
 fn call(conn: *Connection, in: []const u8, out: []u8, op: Op, buf: []u8) CallResult {
     conn.bio_in = in;
     conn.bio_in_used = 0;
@@ -388,7 +507,10 @@ fn call(conn: *Connection, in: []const u8, out: []u8, op: Op, buf: []u8) CallRes
         .write => c.SSL_write_ex(conn.ssl, buf.ptr, buf.len, &n),
         .shutdown => c.SSL_shutdown(conn.ssl),
     };
-    const code = if (rc > 0 or (op == .shutdown and rc == 0)) c.SSL_ERROR_NONE else c.SSL_get_error(conn.ssl, rc);
+    // SSL_shutdown returns 0 when close_notify was sent but the peer's has
+    // not arrived yet; that is success for us.
+    const ok = rc > 0 or (op == .shutdown and rc == 0);
+    const code = if (ok) c.SSL_ERROR_NONE else c.SSL_get_error(conn.ssl, rc);
     const result: CallResult = .{
         .code = code,
         .bytes = n,
@@ -397,35 +519,46 @@ fn call(conn: *Connection, in: []const u8, out: []u8, op: Op, buf: []u8) CallRes
     };
     conn.bio_in = &.{};
     conn.bio_out = &.{};
+    // Nothing to inspect on success or WANT_*; don't leave anything behind
+    // on this OS thread.
+    if (code != c.SSL_ERROR_SSL and code != c.SSL_ERROR_SYSCALL) c.ERR_clear_error();
     return result;
 }
 
-fn fail(conn: *Connection, err: TlsError) TlsError {
+/// Records a failure decided by us rather than by libssl. Caller holds
+/// `ssl_mutex` (or is the handshake).
+fn setFailed(conn: *Connection, err: TlsError, detail: []const u8) TlsError {
     conn.failed = err;
+    conn.diag.detail = detail;
+    conn.diag.not_tls = conn.tracker.not_tls;
     return err;
 }
 
 /// Turns the state left by a failed libssl call (error queue, verify and
-/// info callbacks, record tracker) into a `TlsError` in `conn.failed`, and
-/// clears the error queue.
-fn classifyFailure(conn: *Connection) void {
+/// info callbacks, record tracker) into a sticky `TlsError`, and clears the
+/// error queue. Caller holds `ssl_mutex` (or is the handshake).
+fn classifyFailure(conn: *Connection, code: c_int) TlsError {
     defer c.ERR_clear_error();
 
     // The outermost SSL-library reason explains the failure; the last queue
-    // entry is the best message.
+    // entry is the best message. Shared reason codes (internal error,
+    // allocation failure) can come from any library.
     var ssl_reason: ?c_int = null;
+    var internal = false;
     var last: c_ulong = 0;
     while (true) {
         const e = c.ERR_get_error();
         if (e == 0) break;
         last = e;
-        if (c.ERR_GET_LIB(e) == c.ERR_LIB_SSL) ssl_reason = c.ERR_GET_REASON(e);
+        const reason = c.ERR_GET_REASON(e);
+        if (c.ERR_GET_LIB(e) == c.ERR_LIB_SSL) ssl_reason = reason;
+        if (isInternal(reason)) internal = true;
     }
     if (last != 0) {
         c.ERR_error_string_n(last, &conn.detail_buf, conn.detail_buf.len);
         conn.diag.detail = std.mem.sliceTo(&conn.detail_buf, 0);
     } else {
-        conn.diag.detail = "";
+        conn.diag.detail = if (code == c.SSL_ERROR_SYSCALL) "libssl reported a system error" else "libssl failed without a reason";
     }
     conn.diag.not_tls = conn.tracker.not_tls;
 
@@ -442,10 +575,10 @@ fn classifyFailure(conn: *Connection) void {
                 .reason = certificateReason(ve.code),
                 .depth = std.math.cast(u8, ve.depth),
             };
-            const msg = std.mem.span(c.X509_verify_cert_error_string(ve.code));
-            conn.diag.detail = msg;
+            conn.diag.detail = std.mem.span(c.X509_verify_cert_error_string(ve.code));
             break :blk error.CertificateRejected;
         }
+        if (internal or conn.diag.alert_sent == .internal_error) break :blk error.Internal;
         if (conn.diag.not_tls) break :blk error.ProtocolViolation;
         const reason = ssl_reason orelse break :blk error.Internal;
         if (reason == c.SSL_R_PEER_DID_NOT_RETURN_A_CERTIFICATE) {
@@ -457,14 +590,10 @@ fn classifyFailure(conn: *Connection) void {
             break :blk error.CertificateRejected;
         }
         if (isIncompatible(reason)) break :blk error.Incompatible;
-        if (isInternal(reason)) break :blk error.Internal;
         break :blk error.ProtocolViolation;
     };
     conn.failed = err;
-}
-
-fn setDetail(conn: *Connection, msg: []const u8) void {
-    conn.diag.detail = msg;
+    return err;
 }
 
 fn isIncompatible(reason: c_int) bool {
@@ -480,6 +609,8 @@ fn isIncompatible(reason: c_int) bool {
         "SSL_R_NO_SHARED_SIGNATURE_ALGORITHMS",
         "SSL_R_NO_SUITABLE_SIGNATURE_ALGORITHM",
         "SSL_R_NO_APPLICATION_PROTOCOL",
+        "SSL_R_UNSAFE_LEGACY_RENEGOTIATION_DISABLED",
+        "SSL_R_DH_KEY_TOO_SMALL",
     };
     inline for (names) |name| {
         if (@hasDecl(c, name) and reason == @field(c, name)) return true;
@@ -488,7 +619,11 @@ fn isIncompatible(reason: c_int) bool {
 }
 
 fn isInternal(reason: c_int) bool {
+    // OpenSSL 3 raises internal failures with the shared ERR_R_* reasons;
+    // SSL_R_INTERNAL_ERROR is BoringSSL's spelling.
     const names = .{
+        "ERR_R_INTERNAL_ERROR",
+        "ERR_R_MALLOC_FAILURE",
         "SSL_R_INTERNAL_ERROR",
     };
     inline for (names) |name| {
@@ -528,8 +663,8 @@ fn certificateReason(code: c_int) api.CertificateProblem.Reason {
     return .other;
 }
 
-// Callbacks. libssl calls these synchronously inside `call`; none of them
-// may suspend.
+// Callbacks. libssl calls these synchronously inside `call`, with
+// `ssl_mutex` held; none of them may suspend.
 
 fn fromSsl(ssl: ?*const c.SSL) *Connection {
     return @ptrCast(@alignCast(c.SSL_get_ex_data(ssl, 0).?));
@@ -563,14 +698,28 @@ pub fn infoCallback(ssl: ?*const c.SSL, where: c_int, value: c_int) callconv(.c)
 // Custom BIO: reads from `bio_in`, writes to `bio_out`. Never does I/O; an
 // exhausted window is "retry", which libssl reports as WANT_READ/WANT_WRITE.
 
-pub fn newBioMethod() error{OutOfMemory}!*c.BIO_METHOD {
-    const method = c.BIO_meth_new(c.BIO_get_new_index() | c.BIO_TYPE_SOURCE_SINK, "anytls") orelse
+var bio_method: std.atomic.Value(?*c.BIO_METHOD) = .init(null);
+
+/// The process-wide BIO method, created on first use and never freed:
+/// BIO type indexes are a finite, process-global resource.
+pub fn bioMethod() error{OutOfMemory}!*c.BIO_METHOD {
+    if (bio_method.load(.acquire)) |m| return m;
+    const index = c.BIO_get_new_index();
+    if (index == -1) return error.OutOfMemory;
+    const m = c.BIO_meth_new(index | c.BIO_TYPE_SOURCE_SINK, "anytls") orelse return error.OutOfMemory;
+    if (c.BIO_meth_set_read(m, bioRead) != 1 or
+        c.BIO_meth_set_write(m, bioWrite) != 1 or
+        c.BIO_meth_set_ctrl(m, bioCtrl) != 1 or
+        c.BIO_meth_set_create(m, bioCreate) != 1)
+    {
+        c.BIO_meth_free(m);
         return error.OutOfMemory;
-    _ = c.BIO_meth_set_read(method, bioRead);
-    _ = c.BIO_meth_set_write(method, bioWrite);
-    _ = c.BIO_meth_set_ctrl(method, bioCtrl);
-    _ = c.BIO_meth_set_create(method, bioCreate);
-    return method;
+    }
+    if (bio_method.cmpxchgStrong(null, m, .acq_rel, .acquire)) |existing| {
+        c.BIO_meth_free(m);
+        return existing.?;
+    }
+    return m;
 }
 
 fn bioCreate(bio: ?*c.BIO) callconv(.c) c_int {

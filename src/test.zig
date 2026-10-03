@@ -3,6 +3,9 @@ const Io = std.Io;
 const testing = std.testing;
 
 const anytls = @import("root.zig");
+const c = @import("c");
+
+const key_update_count = 200;
 
 const ca_pem = @embedFile("testdata/ca.pem");
 const other_ca_pem = @embedFile("testdata/other-ca.pem");
@@ -37,6 +40,11 @@ const ServerResult = struct {
 };
 
 const Behavior = enum {
+    /// Request many key updates, each followed by one byte of data.
+    key_updates,
+    /// Send a NewSessionTicket split over several records, pausing after
+    /// the first, then "!".
+    fragmented_ticket,
     /// Echo cleartext until close_notify, then send close_notify.
     echo,
     /// Handshake, send "hello", drop TCP at a record boundary.
@@ -72,7 +80,7 @@ fn serverTask(io: Io, listener: *Io.net.Server, ctx: *anytls.ServerContext, beha
             var buf: [64]u8 = undefined;
             _ = conn.read(&buf) catch |err| switch (err) {
                 error.EndOfStream => {},
-                error.ReadFailed => if (conn.failure()) |e| return result.record(&conn, e),
+                else => |e| return result.record(&conn, e),
             };
         },
         .echo => {
@@ -80,12 +88,45 @@ fn serverTask(io: Io, listener: *Io.net.Server, ctx: *anytls.ServerContext, beha
             while (true) {
                 const n = conn.read(&buf) catch |err| switch (err) {
                     error.EndOfStream => break,
-                    error.ReadFailed => return result.record(&conn, conn.failure() orelse err),
+                    else => |e| return result.record(&conn, e),
                 };
                 try conn.write(buf[0..n]);
                 try conn.flush();
             }
             try conn.close();
+        },
+        .key_updates => {
+            for (0..key_update_count) |_| {
+                if (c.SSL_key_update(conn.ssl, c.SSL_KEY_UPDATE_REQUESTED) != 1) return error.KeyUpdate;
+                try conn.write("x");
+                try conn.flush();
+            }
+            var buf: [64]u8 = undefined;
+            _ = conn.read(&buf) catch {};
+        },
+        .fragmented_ticket => {
+            _ = c.SSL_ctrl(conn.ssl, c.SSL_CTRL_SET_MAX_SEND_FRAGMENT, 512, null);
+            if (c.SSL_new_session_ticket(conn.ssl) != 1) return error.Ticket;
+            // Flushes the ticket (several records) ahead of "!".
+            try conn.write("!");
+            const all = try std.testing.allocator.dupe(u8, tcp_writer.interface.buffered());
+            defer std.testing.allocator.free(all);
+            tcp_writer.interface.end = 0;
+            const first = 5 + @as(usize, std.mem.readInt(u16, all[3..5], .big));
+            try std.testing.expect(first < all.len);
+            try tcp_writer.interface.writeAll(all[0..first]);
+            try tcp_writer.interface.flush();
+            // Long enough for the client to see the first part and act.
+            try io.sleep(.fromMilliseconds(300), .awake);
+            try tcp_writer.interface.writeAll(all[first..]);
+            try tcp_writer.interface.flush();
+            // Echo until the client is done.
+            var buf: [64]u8 = undefined;
+            while (true) {
+                const n = conn.read(&buf) catch break;
+                try conn.write(buf[0..n]);
+                try conn.flush();
+            }
         },
         .hello_then_eof => {
             try conn.write("hello");
@@ -446,9 +487,9 @@ test "concurrent reader and writer tasks" {
     rng.random().bytes(send_data);
 
     const Sender = struct {
-        fn run(c: *anytls.Connection, data: []const u8) anyerror!void {
+        fn run(cn: *anytls.Connection, data: []const u8) anyerror!void {
             var wbuf: [16 * 1024]u8 = undefined;
-            var writer = c.writer(&wbuf);
+            var writer = cn.writer(&wbuf);
             var off: usize = 0;
             while (off < data.len) {
                 const n = @min(data.len - off, 3000);
@@ -495,7 +536,7 @@ test "transport read failure in the handshake stays a transport error" {
     var conn: anytls.Connection = undefined;
     try conn.initClient(&ctx, io, &reader, &discarding.writer, .{ .server_name = "localhost" });
     defer conn.deinit();
-    try testing.expectError(error.ReadFailed, conn.handshake());
+    try testing.expectError(error.TransportReadFailed, conn.handshake());
     try testing.expectEqual(null, conn.failure());
 }
 
@@ -543,4 +584,182 @@ test "CA sources: file, dir, system" {
         else => return err,
     };
     from_system.deinit();
+}
+
+test "a read-only connection answers any number of key update requests" {
+    var env: Env = undefined;
+    try env.start(.{ .certificate = server_cert }, .key_updates);
+    defer env.stop();
+    var ctx = try clientContext(&env, .{ .ca = .{ .pem = ca_pem } });
+    defer ctx.deinit();
+
+    var conn: anytls.Connection = undefined;
+    try env.connect(&conn, &ctx, "localhost");
+    defer conn.deinit();
+    try conn.handshake();
+
+    var rbuf: [64]u8 = undefined;
+    var reader = conn.reader(&rbuf);
+    var got: [key_update_count]u8 = undefined;
+    try reader.interface.readSliceAll(&got);
+    try env.finish();
+}
+
+/// Waits until libssl has consumed the first part of the ticket, i.e. is
+/// back "in init" and will not let a write through without more input.
+fn waitHalfReceived(conn: *anytls.Connection, io: Io) !void {
+    for (0..1000) |_| {
+        conn.ssl_mutex.lockUncancelable(io);
+        const in_init = c.SSL_in_init(conn.ssl) != 0;
+        conn.ssl_mutex.unlock(io);
+        if (in_init) return;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    return error.TicketNeverHalfReceived;
+}
+
+/// Client side of `.fragmented_ticket`: the ticket arrives in parts, and
+/// libssl will not let a write through until it has all of it.
+fn fragmentedTicketClient(concurrent_reader: bool, op: enum { write, close }) !void {
+    var env: Env = undefined;
+    // Client certificates make the ticket big enough to span records.
+    try env.start(.{ .certificate = server_cert, .client_auth = .{ .ca = .{ .pem = ca_pem } } }, .fragmented_ticket);
+    defer env.stop();
+    var ctx = try clientContext(&env, .{ .ca = .{ .pem = ca_pem }, .certificate = client_cert });
+    defer ctx.deinit();
+
+    var conn: anytls.Connection = undefined;
+    try env.connect(&conn, &ctx, "localhost");
+    defer conn.deinit();
+    try conn.handshake();
+
+    const ReadOne = struct {
+        fn run(cn: *anytls.Connection) anyerror!u8 {
+            var b: [1]u8 = undefined;
+            _ = try cn.read(&b);
+            return b[0];
+        }
+    };
+    if (concurrent_reader) {
+        // The reader consumes the first ticket record and then waits for
+        // the rest while the writer runs.
+        var reading = try env.io.concurrent(ReadOne.run, .{&conn});
+        try waitHalfReceived(&conn, env.io);
+        switch (op) {
+            .write => {
+                try conn.write("y");
+                try conn.flush();
+            },
+            .close => try conn.close(),
+        }
+        try testing.expectEqual('!', try reading.await(env.io));
+    } else {
+        // A read consumes the first ticket record, then is canceled while
+        // waiting for the rest (a read timeout). With no read in progress
+        // the writer has to feed libssl itself.
+        var reading = try env.io.concurrent(ReadOne.run, .{&conn});
+        try waitHalfReceived(&conn, env.io);
+        try testing.expectError(error.TransportReadFailed, reading.cancel(env.io));
+        try testing.expectEqual(error.Canceled, env.tcp_reader.err.?);
+        switch (op) {
+            .write => {
+                try conn.write("y");
+                try conn.flush();
+            },
+            .close => try conn.close(),
+        }
+        try testing.expectEqual('!', try ReadOne.run(&conn));
+    }
+    if (op == .write) {
+        try testing.expectEqual('y', try ReadOne.run(&conn));
+        try conn.close();
+    }
+    try env.finish();
+}
+
+test "write while a post-handshake message is half received, with a concurrent reader" {
+    try fragmentedTicketClient(true, .write);
+}
+
+test "close while a post-handshake message is half received, with a concurrent reader" {
+    try fragmentedTicketClient(true, .close);
+}
+
+test "write while a post-handshake message is half received, after a canceled read" {
+    try fragmentedTicketClient(false, .write);
+}
+
+test "close_notify during the handshake is truncation" {
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ctx = try anytls.ClientContext.init(testing.allocator, io, .{ .ca = .{ .pem = ca_pem } }, null);
+    defer ctx.deinit();
+
+    var in_buf: [anytls.input_buffer_len]u8 = undefined;
+    const alert = [_]u8{ 0x15, 0x03, 0x03, 0x00, 0x02, 0x01, 0x00 };
+    @memcpy(in_buf[0..alert.len], &alert);
+    var reader: Io.Reader = .fixed(in_buf[0..alert.len]);
+    reader.buffer = &in_buf;
+    var out_buf: [anytls.output_buffer_len]u8 = undefined;
+    var discarding = Io.Writer.Discarding.init(&out_buf);
+
+    var conn: anytls.Connection = undefined;
+    try conn.initClient(&ctx, io, &reader, &discarding.writer, .{ .server_name = "localhost" });
+    defer conn.deinit();
+    try testing.expectError(error.ConnectionTruncated, conn.handshake());
+}
+
+test "splat writes few records" {
+    var env: Env = undefined;
+    try env.start(.{ .certificate = server_cert }, .echo);
+    defer env.stop();
+    var ctx = try clientContext(&env, .{ .ca = .{ .pem = ca_pem } });
+    defer ctx.deinit();
+
+    var conn: anytls.Connection = undefined;
+    try env.connect(&conn, &ctx, "localhost");
+    defer conn.deinit();
+    try conn.handshake();
+
+    var wbuf: [16]u8 = undefined;
+    var writer = conn.writer(&wbuf);
+    const before = env.tcp_writer.interface.end;
+    try writer.interface.splatByteAll(' ', 500);
+    // One record's overhead, not one per byte.
+    try testing.expect(env.tcp_writer.interface.end - before < 600);
+    try conn.close();
+    try env.finish();
+}
+
+test "transport write failure is sticky and named" {
+    var env: Env = undefined;
+    try env.start(.{ .certificate = server_cert }, .echo);
+    defer env.stop();
+    var ctx = try clientContext(&env, .{ .ca = .{ .pem = ca_pem } });
+    defer ctx.deinit();
+
+    var conn: anytls.Connection = undefined;
+    try env.connect(&conn, &ctx, "localhost");
+    defer conn.deinit();
+    try conn.handshake();
+
+    env.tcp.shutdown(env.io, .send) catch {};
+    var wbuf: [64]u8 = undefined;
+    var writer = conn.writer(&wbuf);
+    try writer.interface.writeAll("after shutdown");
+    try testing.expectError(error.WriteFailed, writer.interface.flush());
+    try testing.expectEqual(error.TransportWriteFailed, writer.err.?);
+    try testing.expect(env.tcp_writer.err != null);
+    try testing.expectError(error.TransportWriteFailed, conn.flush());
+    env.finish() catch {};
+}
+
+test "invalid server ALPN list does not leak" {
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    try testing.expectError(error.InvalidAlpnProtocols, anytls.ServerContext.init(testing.allocator, threaded.io(), .{
+        .certificate = server_cert,
+        .alpn = &.{""},
+    }, null));
 }

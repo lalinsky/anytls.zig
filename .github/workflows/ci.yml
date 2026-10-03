@@ -24,3 +24,6 @@ jobs:
 
       - name: Test (openssl backend)
         run: zig build test -Doptimize=${{ matrix.optimize }} --summary all
+
+      - name: Test (tls_zig backend)
+        run: zig build test -Dbackend=tls_zig -Doptimize=${{ matrix.optimize }} --summary all

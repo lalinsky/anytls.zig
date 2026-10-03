@@ -1,0 +1,244 @@
+//! tls.zig contexts: parsed certificates, keys and trust anchors, shared
+//! read-only by every connection created from them.
+const std = @import("std");
+const Io = std.Io;
+const Allocator = std.mem.Allocator;
+const tls = @import("tls");
+const api = @import("../api.zig");
+const source = @import("../source.zig");
+
+const ConfigError = api.ConfigError;
+const ConfigDiagnostics = api.ConfigDiagnostics;
+const Bundle = tls.config.cert.Bundle;
+const CertKeyPair = tls.config.CertKeyPair;
+
+pub const ClientContext = struct {
+    gpa: Allocator,
+    root_ca: Bundle = .empty,
+    verify: bool,
+    auth: ?CertKeyPair = null,
+    alpn: Alpn = .{},
+    live: source.LiveCount = .{},
+
+    pub fn init(gpa: Allocator, io: Io, opt: api.ClientOptions, diag: ?*ConfigDiagnostics) ConfigError!ClientContext {
+        var scratch: ConfigDiagnostics = .{};
+        const d = diag orelse &scratch;
+        d.len = 0;
+
+        var ctx: ClientContext = .{ .gpa = gpa, .verify = opt.verify == .full };
+        errdefer ctx.free();
+        if (ctx.verify) ctx.root_ca = try loadCa(gpa, io, opt.ca, d);
+        if (opt.certificate) |cert| ctx.auth = try loadCertificate(gpa, io, cert, d);
+        ctx.alpn = try .init(gpa, opt.alpn);
+        return ctx;
+    }
+
+    pub fn deinit(ctx: *ClientContext) void {
+        ctx.live.check();
+        ctx.free();
+        ctx.* = undefined;
+    }
+
+    fn free(ctx: *ClientContext) void {
+        ctx.root_ca.deinit(ctx.gpa);
+        if (ctx.auth) |*kp| kp.deinit(ctx.gpa);
+        ctx.alpn.deinit(ctx.gpa);
+    }
+};
+
+pub const ServerContext = struct {
+    gpa: Allocator,
+    auth: CertKeyPair,
+    client_auth: ?ClientAuth = null,
+    alpn: Alpn = .{},
+    live: source.LiveCount = .{},
+
+    const ClientAuth = struct {
+        root_ca: Bundle,
+        mode: api.ClientAuth.Mode,
+    };
+
+    pub fn init(gpa: Allocator, io: Io, opt: api.ServerOptions, diag: ?*ConfigDiagnostics) ConfigError!ServerContext {
+        var scratch: ConfigDiagnostics = .{};
+        const d = diag orelse &scratch;
+        d.len = 0;
+
+        var auth = try loadCertificate(gpa, io, opt.certificate, d);
+        errdefer auth.deinit(gpa);
+        var client_auth: ?ClientAuth = null;
+        if (opt.client_auth) |ca| client_auth = .{ .root_ca = try loadCa(gpa, io, ca.ca, d), .mode = ca.mode };
+        errdefer if (client_auth) |*ca| ca.root_ca.deinit(gpa);
+        return .{
+            .gpa = gpa,
+            .auth = auth,
+            .client_auth = client_auth,
+            .alpn = try .init(gpa, opt.alpn),
+        };
+    }
+
+    pub fn deinit(ctx: *ServerContext) void {
+        ctx.live.check();
+        ctx.auth.deinit(ctx.gpa);
+        if (ctx.client_auth) |*ca| ca.root_ca.deinit(ctx.gpa);
+        ctx.alpn.deinit(ctx.gpa);
+        ctx.* = undefined;
+    }
+};
+
+/// ALPN protocol names owned by the context: tls.zig hands out the
+/// negotiated protocol as a slice into this list.
+const Alpn = struct {
+    names: []const []const u8 = &.{},
+    bytes: []u8 = &.{},
+
+    fn init(gpa: Allocator, protocols: []const []const u8) ConfigError!Alpn {
+        var wire: [api.max_alpn_wire_len]u8 = undefined;
+        _ = try api.alpnWireFormat(&wire, protocols);
+        var total: usize = 0;
+        for (protocols) |p| total += p.len;
+        const bytes = try gpa.alloc(u8, total);
+        errdefer gpa.free(bytes);
+        const names = try gpa.alloc([]const u8, protocols.len);
+        var off: usize = 0;
+        for (protocols, names) |p, *name| {
+            @memcpy(bytes[off..][0..p.len], p);
+            name.* = bytes[off..][0..p.len];
+            off += p.len;
+        }
+        return .{ .names = names, .bytes = bytes };
+    }
+
+    fn deinit(a: *Alpn, gpa: Allocator) void {
+        gpa.free(a.names);
+        gpa.free(a.bytes);
+        a.* = .{};
+    }
+};
+
+fn loadCertificate(gpa: Allocator, io: Io, src: api.CertificateSource, d: *ConfigDiagnostics) ConfigError!CertKeyPair {
+    const chain = try source.read(gpa, io, src.chain, d);
+    defer chain.deinit(gpa);
+    const key = try source.read(gpa, io, src.key, d);
+    defer key.deinit(gpa);
+
+    var kp = CertKeyPair.fromSlice(gpa, io, chain.bytes, key.bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        inline else => |e| {
+            const name = @errorName(e);
+            d.set("{s}", .{name});
+            const is_cert = comptime std.mem.startsWith(u8, name, "Certificate") or
+                std.mem.eql(u8, name, "MissingEndCertificateMarker");
+            return if (is_cert) error.InvalidCertificate else error.InvalidPrivateKey;
+        },
+    };
+    errdefer kp.deinit(gpa);
+    if (kp.bundle.map.count() == 0) {
+        d.set("certificate: no certificate found", .{});
+        return error.InvalidCertificate;
+    }
+    try checkKeyMatches(&kp, d);
+    return kp;
+}
+
+/// tls.zig does not check that the key belongs to the certificate. Compare
+/// the public keys where that is cheap (ECDSA); other key types are not
+/// checked.
+fn checkKeyMatches(kp: *const CertKeyPair, d: *ConfigDiagnostics) ConfigError!void {
+    const pair = kp.ecdsa_key_pair orelse return;
+    // The leaf is the first certificate in the chain.
+    const leaf = std.crypto.Certificate.parse(.{ .buffer = kp.bundle.bytes.items, .index = 0 }) catch {
+        d.set("certificate: cannot parse leaf", .{});
+        return error.InvalidCertificate;
+    };
+    const matches = switch (pair) {
+        inline else => |key_pair| blk: {
+            const public = key_pair.public_key.toUncompressedSec1();
+            break :blk std.mem.eql(u8, leaf.pubKey(), &public);
+        },
+    };
+    if (!matches) {
+        d.set("private key does not match the certificate", .{});
+        return error.KeyMismatch;
+    }
+}
+
+fn loadCa(gpa: Allocator, io: Io, src: api.CaSource, d: *ConfigDiagnostics) ConfigError!Bundle {
+    var bundle: Bundle = .empty;
+    errdefer bundle.deinit(gpa);
+    const now = Io.Clock.real.now(io).toSeconds();
+    switch (src) {
+        .none => {},
+        .pem => |pem| if (try addPem(&bundle, gpa, now, pem, d) == 0) return source.noCaCerts(d, "PEM"),
+        .file => |path| {
+            const bytes = try source.readFile(gpa, io, Io.Dir.cwd(), path, d);
+            defer gpa.free(bytes);
+            if (try addPem(&bundle, gpa, now, bytes, d) == 0) return source.noCaCerts(d, path);
+        },
+        .dir => |path| {
+            const adder: PemAdder = .{ .bundle = &bundle, .gpa = gpa, .now = now, .d = d };
+            if (try source.forEachFileInDir(gpa, io, path, d, adder, PemAdder.add) == 0)
+                return source.noCaCerts(d, path);
+        },
+        .system => {
+            bundle.rescan(gpa, io, Io.Clock.real.now(io)) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Canceled => return error.Canceled,
+                else => {
+                    d.set("system trust store: {t}", .{err});
+                    return error.CaUnavailable;
+                },
+            };
+            if (bundle.map.count() == 0) {
+                d.set("system trust store: no certificates found", .{});
+                return error.CaUnavailable;
+            }
+        },
+    }
+    return bundle;
+}
+
+const PemAdder = struct {
+    bundle: *Bundle,
+    gpa: Allocator,
+    now: i64,
+    d: *ConfigDiagnostics,
+
+    fn add(a: PemAdder, bytes: []const u8) ConfigError!usize {
+        return addPem(a.bundle, a.gpa, a.now, bytes, a.d);
+    }
+};
+
+/// Adds the PEM certificates in `pem` to `bundle`; returns how many.
+fn addPem(bundle: *Bundle, gpa: Allocator, now_sec: i64, pem: []const u8, d: *ConfigDiagnostics) ConfigError!usize {
+    const begin_marker = "-----BEGIN CERTIFICATE-----";
+    const end_marker = "-----END CERTIFICATE-----";
+    const base64 = std.base64.standard.decoderWithIgnore(" \t\r\n");
+    const before = bundle.map.count();
+
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, pem, start, begin_marker)) |begin| {
+        const cert_start = begin + begin_marker.len;
+        const cert_end = std.mem.indexOfPos(u8, pem, cert_start, end_marker) orelse {
+            d.set("CA certificate: missing end marker", .{});
+            return error.InvalidCaCertificates;
+        };
+        start = cert_end + end_marker.len;
+        const encoded = pem[cert_start..cert_end];
+        const max_len = base64.calcSizeUpperBound(encoded.len);
+        try bundle.bytes.ensureUnusedCapacity(gpa, max_len);
+        const decoded_start: u32 = @intCast(bundle.bytes.items.len);
+        const n = base64.decode(bundle.bytes.unusedCapacitySlice(), encoded) catch {
+            d.set("CA certificate: invalid base64", .{});
+            return error.InvalidCaCertificates;
+        };
+        bundle.bytes.items.len += n;
+        bundle.parseCert(gpa, decoded_start, now_sec) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                d.set("CA certificate: {t}", .{err});
+                return error.InvalidCaCertificates;
+            },
+        };
+    }
+    return bundle.map.count() - before;
+}

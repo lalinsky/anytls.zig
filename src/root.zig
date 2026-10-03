@@ -23,7 +23,47 @@ const impl = switch (backend) {
         const ServerContext = context.ServerContext;
         const Connection = @import("openssl/Connection.zig");
     },
-    .tls_zig => @compileError("the tls_zig backend has not been ported to the new API yet"),
+    .tls_zig => struct {
+        const context = @import("tlszig/context.zig");
+        const ClientContext = context.ClientContext;
+        const ServerContext = context.ServerContext;
+        const Connection = @import("tlszig/Connection.zig");
+    },
+};
+
+/// What the selected backend supports, for adapting at compile time.
+pub const features: Features = switch (backend) {
+    .openssl => .{},
+    .tls_zig => .{
+        .server_tls_1_2 = false,
+        .verify_ip_address = false,
+        .certificate_depth = false,
+        .client_handshake_alerts = false,
+        .fragmented_post_handshake_messages = false,
+        .key_mismatch_detection = .ecdsa_only,
+        .buffered_writes = false,
+    },
+};
+
+pub const Features = struct {
+    /// The server accepts TLS 1.2 clients (otherwise TLS 1.3 only).
+    server_tls_1_2: bool = true,
+    /// A client can verify an IP literal `server_name` against the
+    /// certificate. Without it, such a connection fails with
+    /// `error.Unsupported` unless verification is off.
+    verify_ip_address: bool = true,
+    /// `CertificateProblem.depth` is filled in.
+    certificate_depth: bool = true,
+    /// A client tells the server why its handshake failed.
+    client_handshake_alerts: bool = true,
+    /// Post-handshake messages split across records (large session tickets)
+    /// are accepted.
+    fragmented_post_handshake_messages: bool = true,
+    /// Which keys a context checks against their certificate.
+    key_mismatch_detection: enum { all, ecdsa_only } = .all,
+    /// Records written between flushes are batched in the transport writer;
+    /// otherwise each record is flushed as it is written.
+    buffered_writes: bool = true,
 };
 
 pub const ClientContext = impl.ClientContext;

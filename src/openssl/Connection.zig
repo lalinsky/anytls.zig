@@ -157,13 +157,13 @@ fn init(conn: *Connection, shared: *context.Shared, io: Io, input: *Io.Reader, o
         .input = input,
         .output = output,
     };
-    if (std.debug.runtime_safety) _ = shared.live.fetchAdd(1, .monotonic);
+    shared.live.inc();
 }
 
 /// Frees libssl state. Does not close the transport.
 pub fn deinit(conn: *Connection) void {
     c.SSL_free(conn.ssl);
-    if (std.debug.runtime_safety) _ = conn.shared.live.fetchSub(1, .monotonic);
+    conn.shared.live.dec();
     conn.* = undefined;
 }
 

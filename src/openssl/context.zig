@@ -5,6 +5,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const c = @import("c");
 const api = @import("../api.zig");
+const source = @import("../source.zig");
 const Connection = @import("Connection.zig");
 
 const ConfigError = api.ConfigError;
@@ -21,10 +22,7 @@ pub const Shared = struct {
     alpn_select: ?*AlpnSelect = null,
     /// Client: verify the server's name.
     verify_name: bool = false,
-    /// Live connections, counted in safe builds to catch a context being
-    /// deinitialized too early.
-    live: if (std.debug.runtime_safety) std.atomic.Value(u32) else void =
-        if (std.debug.runtime_safety) .init(0) else {},
+    live: source.LiveCount = .{},
 
     fn init(gpa: Allocator, method: ?*const c.SSL_METHOD) ConfigError!Shared {
         const ssl_ctx = c.SSL_CTX_new(method) orelse return error.OutOfMemory;
@@ -42,10 +40,7 @@ pub const Shared = struct {
     }
 
     fn deinit(s: *Shared) void {
-        if (std.debug.runtime_safety) {
-            const live = s.live.load(.monotonic);
-            if (live != 0) std.log.scoped(.anytls).err("context deinitialized with {d} live connection(s)", .{live});
-        }
+        s.live.check();
         c.SSL_CTX_free(s.ssl_ctx);
         if (s.alpn_select) |a| s.gpa.destroy(a);
         s.* = undefined;
@@ -156,40 +151,10 @@ fn alpnSelect(
 
 // Loading
 
-const max_file_size = 16 * 1024 * 1024;
-
-/// Bytes of a `Source`; owned (and freed by `deinit`) when read from a file.
-const Loaded = struct {
-    bytes: []const u8,
-    owned: bool,
-
-    fn deinit(l: Loaded, gpa: Allocator) void {
-        if (l.owned) gpa.free(l.bytes);
-    }
-};
-
-fn readSource(gpa: Allocator, io: Io, src: api.Source, d: *ConfigDiagnostics) ConfigError!Loaded {
-    return switch (src) {
-        .pem => |pem| .{ .bytes = pem, .owned = false },
-        .file => |path| .{ .bytes = try readFile(gpa, io, Io.Dir.cwd(), path, d), .owned = true },
-    };
-}
-
-fn readFile(gpa: Allocator, io: Io, dir: Io.Dir, path: []const u8, d: *ConfigDiagnostics) ConfigError![]u8 {
-    return dir.readFileAlloc(io, path, gpa, .limited(max_file_size)) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Canceled => return error.Canceled,
-        else => {
-            d.set("{s}: {t}", .{ path, err });
-            return error.FileUnreadable;
-        },
-    };
-}
-
 fn loadCertificate(ctx: *c.SSL_CTX, gpa: Allocator, io: Io, src: api.CertificateSource, d: *ConfigDiagnostics) ConfigError!void {
-    const chain = try readSource(gpa, io, src.chain, d);
+    const chain = try source.read(gpa, io, src.chain, d);
     defer chain.deinit(gpa);
-    const key = try readSource(gpa, io, src.key, d);
+    const key = try source.read(gpa, io, src.key, d);
     defer key.deinit(gpa);
 
     {
@@ -238,52 +203,28 @@ fn loadCa(ctx: *c.SSL_CTX, gpa: Allocator, io: Io, src: api.CaSource, d: *Config
     const store = c.SSL_CTX_get_cert_store(ctx) orelse return error.OutOfMemory;
     switch (src) {
         .none => {},
-        .pem => |pem| if (try addPemCerts(store, pem, d) == 0) return noCaCerts(d, "PEM"),
+        .pem => |pem| if (try addPemCerts(store, pem, d) == 0) return source.noCaCerts(d, "PEM"),
         .file => |path| {
-            const bytes = try readFile(gpa, io, Io.Dir.cwd(), path, d);
+            const bytes = try source.readFile(gpa, io, Io.Dir.cwd(), path, d);
             defer gpa.free(bytes);
-            if (try addPemCerts(store, bytes, d) == 0) return noCaCerts(d, path);
+            if (try addPemCerts(store, bytes, d) == 0) return source.noCaCerts(d, path);
         },
         .dir => |path| {
-            var dir = Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                else => {
-                    d.set("{s}: {t}", .{ path, err });
-                    return error.FileUnreadable;
-                },
-            };
-            defer dir.close(io);
-            var count: usize = 0;
-            var it = dir.iterate();
-            while (it.next(io) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                else => {
-                    d.set("{s}: {t}", .{ path, err });
-                    return error.FileUnreadable;
-                },
-            }) |entry| {
-                switch (entry.kind) {
-                    .file, .sym_link => {},
-                    else => continue,
-                }
-                const bytes = try readFile(gpa, io, dir, entry.name, d);
-                defer gpa.free(bytes);
-                // Files without certificates (READMEs, CRLs) are skipped.
-                count += addPemCerts(store, bytes, d) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => 0,
-                };
-            }
-            if (count == 0) return noCaCerts(d, path);
+            if (try source.forEachFileInDir(gpa, io, path, d, PemAdder{ .store = store, .d = d }, PemAdder.add) == 0)
+                return source.noCaCerts(d, path);
         },
         .system => try loadSystemCa(store, gpa, io, d),
     }
 }
 
-fn noCaCerts(d: *ConfigDiagnostics, what: []const u8) ConfigError {
-    d.set("{s}: no CA certificates found", .{what});
-    return error.InvalidCaCertificates;
-}
+const PemAdder = struct {
+    store: *c.X509_STORE,
+    d: *ConfigDiagnostics,
+
+    fn add(a: PemAdder, bytes: []const u8) ConfigError!usize {
+        return addPemCerts(a.store, bytes, a.d);
+    }
+};
 
 /// Adds every PEM certificate in `pem` to `store`; returns how many.
 fn addPemCerts(store: *c.X509_STORE, pem: []const u8, d: *ConfigDiagnostics) ConfigError!usize {

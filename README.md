@@ -6,7 +6,8 @@
 TLS client/server for Zig with a backend selected at build time:
 
 - `openssl` — system libssl (OpenSSL 3), driven sans-I/O through a custom BIO
-- `tls_zig` — pure Zig [ianic/tls.zig] (not yet ported to the current API)
+- `tls_zig` — pure Zig [ianic/tls.zig], with no system dependency but fewer
+  features (see below)
 
 All transport I/O goes through a caller-provided [`std.Io.Reader`]/[`std.Io.Writer`]
 pair, so any `std.Io` implementation works, including green-thread schedulers
@@ -101,6 +102,26 @@ var ctx = try anytls.ServerContext.init(gpa, io, .{
 var conn: anytls.Connection = undefined;
 try conn.initServer(&ctx, io, &tcp_reader.interface, &tcp_writer.interface);
 ```
+
+### Backend differences
+
+Both backends implement the same API. `anytls.features` describes what the
+selected one supports, so code can adapt at compile time. The `tls_zig`
+backend is weaker:
+
+- its server speaks TLS 1.3 only;
+- it cannot verify an IP address as `server_name` (`initClient` returns
+  `error.Unsupported` unless verification is off);
+- its client does not send an alert when its handshake fails, so the server
+  only sees the connection end;
+- certificate problems carry no chain depth, and unknown alert codes are
+  reported without the code;
+- it rejects post-handshake messages split across records (large session
+  tickets);
+- a context checks only ECDSA keys against their certificate;
+- every record is flushed to the transport as it is written;
+- RSA handshakes are about 10× slower than with OpenSSL, and Debug builds are
+  much slower still.
 
 ### Concurrency
 

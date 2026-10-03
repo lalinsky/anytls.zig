@@ -107,6 +107,9 @@ pub const ConnectionInitError = error{
     MissingServerName,
     /// The server name is too long or contains a NUL byte.
     InvalidServerName,
+    /// The selected backend cannot do what was asked (e.g. tls_zig cannot
+    /// verify an IP address).
+    Unsupported,
     OutOfMemory,
 };
 

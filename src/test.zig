@@ -3,7 +3,12 @@ const Io = std.Io;
 const testing = std.testing;
 
 const anytls = @import("root.zig");
-const c = @import("c");
+const features = anytls.features;
+/// libssl, for the tests that need to drive the OpenSSL backend directly.
+const c = switch (anytls.backend) {
+    .openssl => @import("c"),
+    .tls_zig => struct {},
+};
 
 const key_update_count = 200;
 
@@ -95,7 +100,7 @@ fn serverTask(io: Io, listener: *Io.net.Server, ctx: *anytls.ServerContext, beha
             }
             try conn.close();
         },
-        .key_updates => {
+        .key_updates => if (anytls.backend != .openssl) unreachable else {
             for (0..key_update_count) |_| {
                 if (c.SSL_key_update(conn.ssl, c.SSL_KEY_UPDATE_REQUESTED) != 1) return error.KeyUpdate;
                 try conn.write("x");
@@ -104,7 +109,7 @@ fn serverTask(io: Io, listener: *Io.net.Server, ctx: *anytls.ServerContext, beha
             var buf: [64]u8 = undefined;
             _ = conn.read(&buf) catch {};
         },
-        .fragmented_ticket => {
+        .fragmented_ticket => if (anytls.backend != .openssl) unreachable else {
             _ = c.SSL_ctrl(conn.ssl, c.SSL_CTRL_SET_MAX_SEND_FRAGMENT, 512, null);
             if (c.SSL_new_session_ticket(conn.ssl) != 1) return error.Ticket;
             // Flushes the ticket (several records) ahead of "!".
@@ -135,9 +140,8 @@ fn serverTask(io: Io, listener: *Io.net.Server, ctx: *anytls.ServerContext, beha
         .hello_then_truncate => {
             try conn.write("hello");
             try conn.flush();
-            try conn.write("world");
-            // Cut the last record short before it reaches the network.
-            tcp_writer.interface.end -= 3;
+            // A record header announcing 40 bytes, followed by only 3.
+            try tcp_writer.interface.writeAll(&.{ 23, 3, 3, 0, 40, 1, 2, 3 });
             try tcp_writer.interface.flush();
         },
     }
@@ -322,11 +326,15 @@ test "unknown CA: CertificateRejected with reason and depth" {
     try testing.expectError(error.CertificateRejected, conn.handshake());
     const diag = conn.diagnostics();
     try testing.expectEqual(.untrusted, diag.certificate.?.reason);
-    try testing.expectEqual(0, diag.certificate.?.depth.?);
-    try testing.expectEqual(.unknown_ca, diag.alert_sent.?);
-
-    try testing.expectError(error.AlertReceived, env.finish());
-    try testing.expectEqual(.unknown_ca, env.server_result.diag.alert_received.?);
+    if (features.certificate_depth) try testing.expectEqual(0, diag.certificate.?.depth.?);
+    if (features.client_handshake_alerts) {
+        try testing.expectEqual(.unknown_ca, diag.alert_sent.?);
+        try testing.expectError(error.AlertReceived, env.finish());
+        try testing.expectEqual(.unknown_ca, env.server_result.diag.alert_received.?);
+    } else {
+        // The server only sees the connection end.
+        try testing.expectError(error.ConnectionTruncated, env.finish());
+    }
 }
 
 test "wrong host name and wrong IP: name_mismatch" {
@@ -338,6 +346,10 @@ test "wrong host name and wrong IP: name_mismatch" {
         defer ctx.deinit();
 
         var conn: anytls.Connection = undefined;
+        if (!features.verify_ip_address and std.mem.eql(u8, name, "127.0.0.2")) {
+            try testing.expectError(error.Unsupported, env.connect(&conn, &ctx, name));
+            continue;
+        }
         try env.connect(&conn, &ctx, name);
         defer conn.deinit();
         try testing.expectError(error.CertificateRejected, conn.handshake());
@@ -354,6 +366,10 @@ test "IP literal verifies against the IP SAN" {
     defer ctx.deinit();
 
     var conn: anytls.Connection = undefined;
+    if (!features.verify_ip_address) {
+        try testing.expectError(error.Unsupported, env.connect(&conn, &ctx, "127.0.0.1"));
+        return;
+    }
     try env.connect(&conn, &ctx, "127.0.0.1");
     defer conn.deinit();
     try conn.handshake();
@@ -587,6 +603,8 @@ test "CA sources: file, dir, system" {
 }
 
 test "a read-only connection answers any number of key update requests" {
+    // Needs libssl to make the server request key updates.
+    if (anytls.backend != .openssl) return error.SkipZigTest;
     var env: Env = undefined;
     try env.start(.{ .certificate = server_cert }, .key_updates);
     defer env.stop();
@@ -608,6 +626,7 @@ test "a read-only connection answers any number of key update requests" {
 /// Waits until libssl has consumed the first part of the ticket, i.e. is
 /// back "in init" and will not let a write through without more input.
 fn waitHalfReceived(conn: *anytls.Connection, io: Io) !void {
+    if (anytls.backend != .openssl) unreachable;
     for (0..1000) |_| {
         conn.ssl_mutex.lockUncancelable(io);
         const in_init = c.SSL_in_init(conn.ssl) != 0;
@@ -621,6 +640,8 @@ fn waitHalfReceived(conn: *anytls.Connection, io: Io) !void {
 /// Client side of `.fragmented_ticket`: the ticket arrives in parts, and
 /// libssl will not let a write through until it has all of it.
 fn fragmentedTicketClient(concurrent_reader: bool, op: enum { write, close }) !void {
+    // Needs libssl to fragment the ticket on the server side.
+    if (anytls.backend != .openssl or !features.fragmented_post_handshake_messages) return error.SkipZigTest;
     var env: Env = undefined;
     // Client certificates make the ticket big enough to span records.
     try env.start(.{ .certificate = server_cert, .client_auth = .{ .ca = .{ .pem = ca_pem } } }, .fragmented_ticket);
@@ -711,6 +732,8 @@ test "close_notify during the handshake is truncation" {
 }
 
 test "splat writes few records" {
+    // Measured in the transport writer's buffer, which needs batching.
+    if (!features.buffered_writes) return error.SkipZigTest;
     var env: Env = undefined;
     try env.start(.{ .certificate = server_cert }, .echo);
     defer env.stop();

@@ -10,6 +10,8 @@ const source = @import("../source.zig");
 const ConfigError = api.ConfigError;
 const ConfigDiagnostics = api.ConfigDiagnostics;
 const Bundle = tls.config.cert.Bundle;
+
+const max_client_alpn_len = @import("../root.zig").features.max_client_alpn_len;
 const CertKeyPair = tls.config.CertKeyPair;
 
 pub const ClientContext = struct {
@@ -29,6 +31,11 @@ pub const ClientContext = struct {
         errdefer ctx.free();
         if (ctx.verify) ctx.root_ca = try loadCa(gpa, io, opt.ca, d);
         if (opt.certificate) |cert| ctx.auth = try loadCertificate(gpa, io, cert, d);
+        // tls.zig's client keeps the negotiated protocol in a 32-byte buffer.
+        for (opt.alpn) |name| if (name.len > max_client_alpn_len) {
+            d.set("ALPN protocol names longer than {d} bytes are not supported", .{max_client_alpn_len});
+            return error.Unsupported;
+        };
         ctx.alpn = try .init(gpa, opt.alpn);
         return ctx;
     }
@@ -121,35 +128,100 @@ fn loadCertificate(gpa: Allocator, io: Io, src: api.CertificateSource, d: *Confi
     const key = try source.read(gpa, io, src.key, d);
     defer key.deinit(gpa);
 
-    var kp = CertKeyPair.fromSlice(gpa, io, chain.bytes, key.bytes) catch |err| switch (err) {
+    // The key only: tls.zig's own chain parsing drops expired certificates
+    // (so the leaf may silently go missing) and leaks when it fails.
+    var kp = CertKeyPair.fromSlice(gpa, io, "", key.bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        inline else => |e| {
-            const name = @errorName(e);
-            d.set("{s}", .{name});
-            const is_cert = comptime std.mem.startsWith(u8, name, "Certificate") or
-                std.mem.eql(u8, name, "MissingEndCertificateMarker");
-            return if (is_cert) error.InvalidCertificate else error.InvalidPrivateKey;
+        else => {
+            d.set("private key: {t}", .{err});
+            return error.InvalidPrivateKey;
         },
     };
     errdefer kp.deinit(gpa);
-    if (kp.bundle.map.count() == 0) {
-        d.set("certificate: no certificate found", .{});
-        return error.InvalidCertificate;
-    }
+    kp.bundle.deinit(gpa);
+    kp.bundle = .empty;
+    try loadChain(&kp.bundle, gpa, chain.bytes, d);
     try checkKeyMatches(&kp, d);
     return kp;
 }
 
+/// Puts the PEM chain into `bundle` exactly as given, leaf first. tls.zig
+/// sends `bundle.bytes` as the chain and uses the map only for the count.
+fn loadChain(bundle: *Bundle, gpa: Allocator, pem: []const u8, d: *ConfigDiagnostics) ConfigError!void {
+    const Map = @FieldType(Bundle, "map");
+    const MapContext = @typeInfo(@TypeOf(Map.putNoClobberContext)).@"fn".params[4].type.?;
+
+    var blocks = PemBlocks{ .pem = pem };
+    while (try blocks.next(bundle, gpa, d, "certificate")) |slice| {
+        // Keyed by the whole certificate, so every certificate counts once.
+        const gop = try bundle.map.getOrPutContext(gpa, slice, MapContext{ .cb = bundle });
+        if (gop.found_existing) {
+            bundle.bytes.items.len = slice.start; // the same certificate twice
+        } else {
+            gop.value_ptr.* = slice.start;
+        }
+    }
+    if (bundle.map.count() == 0) {
+        d.set("certificate: no certificate found", .{});
+        return error.InvalidCertificate;
+    }
+}
+
+/// Iterates PEM CERTIFICATE blocks, decoding each into `bundle.bytes` and
+/// checking it is one DER element.
+const PemBlocks = struct {
+    pem: []const u8,
+    pos: usize = 0,
+
+    const begin_marker = "-----BEGIN CERTIFICATE-----";
+    const end_marker = "-----END CERTIFICATE-----";
+
+    fn next(
+        it: *PemBlocks,
+        bundle: *Bundle,
+        gpa: Allocator,
+        d: *ConfigDiagnostics,
+        comptime what: []const u8,
+    ) ConfigError!?std.crypto.Certificate.der.Element.Slice {
+        const err: ConfigError = if (comptime std.mem.eql(u8, what, "certificate")) error.InvalidCertificate else error.InvalidCaCertificates;
+        const begin = std.mem.indexOfPos(u8, it.pem, it.pos, begin_marker) orelse return null;
+        const start = begin + begin_marker.len;
+        const end = std.mem.indexOfPos(u8, it.pem, start, end_marker) orelse {
+            d.set(what ++ ": missing end marker", .{});
+            return err;
+        };
+        it.pos = end + end_marker.len;
+
+        const base64 = std.base64.standard.decoderWithIgnore(" \t\r\n");
+        const encoded = it.pem[start..end];
+        try bundle.bytes.ensureUnusedCapacity(gpa, base64.calcSizeUpperBound(encoded.len));
+        const decoded_start: u32 = @intCast(bundle.bytes.items.len);
+        const n = base64.decode(bundle.bytes.unusedCapacitySlice(), encoded) catch {
+            d.set(what ++ ": invalid base64", .{});
+            return err;
+        };
+        bundle.bytes.items.len += n;
+        const elem = std.crypto.Certificate.der.Element.parse(bundle.bytes.items, decoded_start) catch {
+            bundle.bytes.items.len = decoded_start;
+            d.set(what ++ ": invalid DER", .{});
+            return err;
+        };
+        if (elem.slice.end != bundle.bytes.items.len) {
+            bundle.bytes.items.len = decoded_start;
+            d.set(what ++ ": invalid DER", .{});
+            return err;
+        }
+        return .{ .start = decoded_start, .end = elem.slice.end };
+    }
+};
+
 /// tls.zig does not check that the key belongs to the certificate. Compare
-/// the public keys where that is cheap (ECDSA); other key types are not
-/// checked.
+/// the public keys where that is cheap (ECDSA); other key types, and leaves
+/// std cannot parse, are not checked.
 fn checkKeyMatches(kp: *const CertKeyPair, d: *ConfigDiagnostics) ConfigError!void {
     const pair = kp.ecdsa_key_pair orelse return;
-    // The leaf is the first certificate in the chain.
-    const leaf = std.crypto.Certificate.parse(.{ .buffer = kp.bundle.bytes.items, .index = 0 }) catch {
-        d.set("certificate: cannot parse leaf", .{});
-        return error.InvalidCertificate;
-    };
+    // loadChain put the leaf first.
+    const leaf = std.crypto.Certificate.parse(.{ .buffer = kp.bundle.bytes.items, .index = 0 }) catch return;
     const matches = switch (pair) {
         inline else => |key_pair| blk: {
             const public = key_pair.public_key.toUncompressedSec1();
@@ -208,31 +280,14 @@ const PemAdder = struct {
     }
 };
 
-/// Adds the PEM certificates in `pem` to `bundle`; returns how many.
+/// Adds the PEM certificates in `pem` to `bundle`; returns how many were
+/// kept. Like std's own loading, expired certificates and a second
+/// certificate with the same subject are dropped.
 fn addPem(bundle: *Bundle, gpa: Allocator, now_sec: i64, pem: []const u8, d: *ConfigDiagnostics) ConfigError!usize {
-    const begin_marker = "-----BEGIN CERTIFICATE-----";
-    const end_marker = "-----END CERTIFICATE-----";
-    const base64 = std.base64.standard.decoderWithIgnore(" \t\r\n");
     const before = bundle.map.count();
-
-    var start: usize = 0;
-    while (std.mem.indexOfPos(u8, pem, start, begin_marker)) |begin| {
-        const cert_start = begin + begin_marker.len;
-        const cert_end = std.mem.indexOfPos(u8, pem, cert_start, end_marker) orelse {
-            d.set("CA certificate: missing end marker", .{});
-            return error.InvalidCaCertificates;
-        };
-        start = cert_end + end_marker.len;
-        const encoded = pem[cert_start..cert_end];
-        const max_len = base64.calcSizeUpperBound(encoded.len);
-        try bundle.bytes.ensureUnusedCapacity(gpa, max_len);
-        const decoded_start: u32 = @intCast(bundle.bytes.items.len);
-        const n = base64.decode(bundle.bytes.unusedCapacitySlice(), encoded) catch {
-            d.set("CA certificate: invalid base64", .{});
-            return error.InvalidCaCertificates;
-        };
-        bundle.bytes.items.len += n;
-        bundle.parseCert(gpa, decoded_start, now_sec) catch |err| switch (err) {
+    var blocks = PemBlocks{ .pem = pem };
+    while (try blocks.next(bundle, gpa, d, "CA certificate")) |slice| {
+        bundle.parseCert(gpa, slice.start, now_sec) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 d.set("CA certificate: {t}", .{err});

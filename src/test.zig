@@ -786,3 +786,71 @@ test "invalid server ALPN list does not leak" {
         .alpn = &.{""},
     }, null));
 }
+
+test "writing after the peer closed without close_notify is not a TLS failure" {
+    var env: Env = undefined;
+    try env.start(.{ .certificate = server_cert }, .hello_then_eof);
+    defer env.stop();
+    var ctx = try clientContext(&env, .{ .ca = .{ .pem = ca_pem } });
+    defer ctx.deinit();
+
+    var conn: anytls.Connection = undefined;
+    try env.connect(&conn, &ctx, "localhost");
+    defer conn.deinit();
+    try conn.handshake();
+
+    var buf: [16]u8 = undefined;
+    try testing.expectEqual(5, try conn.read(&buf));
+    try testing.expectError(error.EndOfStream, conn.read(&buf));
+    try env.finish();
+
+    // Whether the transport still accepts the bytes is up to it; what
+    // matters is that nothing is blamed on TLS.
+    conn.write("late") catch |err| try testing.expectEqual(error.TransportWriteFailed, err);
+    conn.flush() catch |err| try testing.expectEqual(error.TransportWriteFailed, err);
+    try testing.expectEqual(null, conn.failure());
+}
+
+test "an expired leaf certificate is loaded and served as is" {
+    var env: Env = undefined;
+    try env.start(.{ .certificate = .{
+        .chain = .{ .pem = @embedFile("testdata/expired.pem") },
+        .key = .{ .pem = @embedFile("testdata/expired.key") },
+    } }, .echo);
+    defer env.stop();
+
+    // Not verifying: the handshake works with the expired leaf.
+    var insecure = try clientContext(&env, .{ .ca = .none, .verify = .insecure_no_verify });
+    defer insecure.deinit();
+    var conn: anytls.Connection = undefined;
+    try env.connect(&conn, &insecure, "localhost");
+    defer conn.deinit();
+    try conn.handshake();
+    try conn.close();
+    try env.finish();
+}
+
+test "corrupt certificate PEM is InvalidCertificate" {
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var corrupt = server_pem.*;
+    // A character that is not base64, in the middle of the body.
+    corrupt[100] = '!';
+    var diag: anytls.ConfigDiagnostics = .{};
+    try testing.expectError(error.InvalidCertificate, anytls.ServerContext.init(testing.allocator, threaded.io(), .{
+        .certificate = .{ .chain = .{ .pem = &corrupt }, .key = .{ .pem = server_key } },
+    }, &diag));
+}
+
+test "ALPN names up to the backend's limit" {
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const long = "a" ** 40;
+    const result = anytls.ClientContext.init(testing.allocator, threaded.io(), .{ .ca = .none, .alpn = &.{long} }, null);
+    if (features.max_client_alpn_len < long.len) {
+        try testing.expectError(error.Unsupported, result);
+    } else {
+        var ctx = try result;
+        ctx.deinit();
+    }
+}

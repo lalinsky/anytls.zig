@@ -106,19 +106,41 @@ try conn.initServer(&ctx, io, &tcp_reader.interface, &tcp_writer.interface);
 ### Backend differences
 
 Both backends implement the same API. `anytls.features` describes what the
-selected one supports, so code can adapt at compile time. The `tls_zig`
-backend is weaker:
+selected one supports, so code can adapt at compile time.
 
-- its server speaks TLS 1.3 only;
+> **The `tls_zig` backend inherits two security bugs from tls.zig and Zig's
+> std, so do not use it where certificate verification matters:**
+>
+> - **Certificate chains are verified without CA constraints.** std only
+>   checks issuer names, signatures and validity dates, not that an issuer is
+>   a CA, key usage, extended key usage, path length or name constraints. Any
+>   certificate a trusted CA issued (an ordinary server certificate) can sign
+>   a certificate for any other name, and it is accepted. This also affects
+>   client certificates (mTLS).
+> - **A post-handshake message split across records is delivered to the
+>   reader as application data.** A peer that sends a large session ticket
+>   in several records corrupts the cleartext stream.
+
+The `tls_zig` backend is also weaker in these ways:
+
+- its server speaks TLS 1.3 only, and supports only the x25519, P-256 and
+  P-384 groups, without HelloRetryRequest;
 - it cannot verify an IP address as `server_name` (`initClient` returns
   `error.Unsupported` unless verification is off);
 - its client does not send an alert when its handshake fails, so the server
-  only sees the connection end;
+  only sees the connection end; its server answers an untrusted client
+  certificate with `internal_error`;
+- the alert for a failed read is sent only by `close()`;
+- after the transport writer fails, reads fail too;
+- a handshake that failed on a transport error cannot be retried;
 - certificate problems carry no chain depth, and unknown alert codes are
   reported without the code;
-- it rejects post-handshake messages split across records (large session
-  tickets);
-- a context checks only ECDSA keys against their certificate;
+- ALPN protocol names are limited to 32 bytes on the client;
+- private keys must be PKCS#8 or SEC1 (`EC PRIVATE KEY`) PEM, not PKCS#1
+  (`RSA PRIVATE KEY`), and a context checks only ECDSA keys against their
+  certificate;
+- CA certificates with the same subject are deduplicated, and SHA-1
+  certificate signatures are accepted;
 - every record is flushed to the transport as it is written;
 - RSA handshakes are about 10× slower than with OpenSSL, and Debug builds are
   much slower still.
